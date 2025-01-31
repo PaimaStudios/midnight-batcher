@@ -5818,13 +5818,13 @@ dependencies = [
 ]
 
 [[patch.unused]]
-name = "midnight-onchain-runtime"
-version = "0.2.3"
-
-[[patch.unused]]
 name = "midnight-coin-structure"
 version = "0.3.1"
 
 [[patch.unused]]
 name = "midnight-serialize"
 version = "0.3.1"
+
+[[patch.unused]]
+name = "midnight-onchain-runtime"
+version = "0.2.3"

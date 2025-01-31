@@ -33,7 +33,7 @@ async fn submit_tx(
         &state.proving_params,
         &mut zswap_state,
         &transaction.tx,
-        state.network_id.clone(),
+        state.network_id,
     )
     .await;
 

@@ -1,4 +1,5 @@
-use crate::midnight;
+use crate::{endpoints::Error, midnight};
+use anyhow::Context as _;
 use midnight_ledger::{
     structure::{LedgerState, Transaction, DUMMY_PARAMETERS},
     verify::WellFormedStrictness,
@@ -17,70 +18,66 @@ use std::{
 };
 use subxt::{OnlineClient, SubstrateConfig};
 
-const OUTPUT_VK_RAW: &[u8] = include_bytes!(concat!(
+const OUTPUT_VK_RAW: &str = concat!(
     env!("MIDNIGHT_LEDGER_STATIC_DIR"),
     "/zswap/keys/output.verifier"
-));
+);
 
-const OUTPUT_PK_RAW: &[u8] = include_bytes!(concat!(
+const OUTPUT_PK_RAW: &str = concat!(
     env!("MIDNIGHT_LEDGER_STATIC_DIR"),
     "/zswap/keys/output.prover"
-));
+);
 
-const OUTPUT_IR_RAW: &[u8] = include_bytes!(concat!(
+const OUTPUT_IR_RAW: &str = concat!(
     env!("MIDNIGHT_LEDGER_STATIC_DIR"),
     "/zswap/zkir/output.zkir"
-));
+);
 
-const SPEND_VK_RAW: &[u8] = include_bytes!(concat!(
+const SPEND_VK_RAW: &str = concat!(
     env!("MIDNIGHT_LEDGER_STATIC_DIR"),
     "/zswap/keys/spend.verifier"
-));
+);
 
-const SPEND_PK_RAW: &[u8] = include_bytes!(concat!(
+const SPEND_PK_RAW: &str = concat!(
     env!("MIDNIGHT_LEDGER_STATIC_DIR"),
     "/zswap/keys/spend.prover"
-));
+);
 
-const SPEND_IR_RAW: &[u8] = include_bytes!(concat!(
-    env!("MIDNIGHT_LEDGER_STATIC_DIR"),
-    "/zswap/zkir/spend.zkir"
-));
+const SPEND_IR_RAW: &str = concat!(env!("MIDNIGHT_LEDGER_STATIC_DIR"), "/zswap/zkir/spend.zkir");
 
-const SIGN_VK_RAW: &[u8] = include_bytes!(concat!(
+const SIGN_VK_RAW: &str = concat!(
     env!("MIDNIGHT_LEDGER_STATIC_DIR"),
     "/zswap/keys/sign.verifier"
-));
+);
 
-const SIGN_PK_RAW: &[u8] = include_bytes!(concat!(
+const SIGN_PK_RAW: &str = concat!(
     env!("MIDNIGHT_LEDGER_STATIC_DIR"),
     "/zswap/keys/sign.prover"
-));
+);
 
-const SIGN_IR_RAW: &[u8] = include_bytes!(concat!(
-    env!("MIDNIGHT_LEDGER_STATIC_DIR"),
-    "/zswap/zkir/sign.zkir"
-));
+const SIGN_IR_RAW: &str = concat!(env!("MIDNIGHT_LEDGER_STATIC_DIR"), "/zswap/zkir/sign.zkir");
 
 pub fn decode_zswap_proof_params(
-    pk: &[u8],
-    vk: &[u8],
-    ir: &[u8],
-) -> (ProverKey, VerifierKey, IrSource) {
-    let pk = deserialize::<ProverKey, _>(Cursor::new(pk), NetworkId::TestNet).unwrap();
-    let vk = deserialize::<VerifierKey, _>(Cursor::new(vk), NetworkId::TestNet).unwrap();
-    let ir = IrSource::load(Cursor::new(ir)).unwrap();
+    pk: Vec<u8>,
+    vk: Vec<u8>,
+    ir: Vec<u8>,
+) -> anyhow::Result<(ProverKey, VerifierKey, IrSource)> {
+    let pk = deserialize::<ProverKey, _>(Cursor::new(pk), NetworkId::TestNet)
+        .context("Failed to read proving key")?;
+    let vk = deserialize::<VerifierKey, _>(Cursor::new(vk), NetworkId::TestNet)
+        .context("Failed to read verifying key")?;
+    let ir = IrSource::load(Cursor::new(ir)).context("Failed to read ZKIR source")?;
 
-    (pk, vk, ir)
+    Ok((pk, vk, ir))
 }
 
-pub fn read_kzg_params() -> ParamsProver {
+pub fn read_kzg_params() -> anyhow::Result<ParamsProver> {
     let pp = concat!(env!("MIDNIGHT_LEDGER_STATIC_DIR"), "/kzg");
 
-    ParamsProver::read(BufReader::new(File::open(pp).expect(
-        "kzg params not found, run: cargo run --bin make_params to generate new ones",
-    )))
-    .unwrap()
+    ParamsProver::read(BufReader::new(
+        File::open(pp).expect("failed to read kzg params"),
+    ))
+    .context("Failed to read KZG params")
 }
 
 pub struct ProvingParams {
@@ -91,58 +88,78 @@ pub struct ProvingParams {
 }
 
 impl ProvingParams {
-    pub fn new() -> Self {
-        let pp = read_kzg_params();
+    pub fn new() -> anyhow::Result<Self> {
+        let pp = read_kzg_params()?;
 
-        let spend = decode_zswap_proof_params(SPEND_PK_RAW, SPEND_VK_RAW, SPEND_IR_RAW);
-        let output = decode_zswap_proof_params(OUTPUT_PK_RAW, OUTPUT_VK_RAW, OUTPUT_IR_RAW);
-        let sign = decode_zswap_proof_params(SIGN_PK_RAW, SIGN_VK_RAW, SIGN_IR_RAW);
+        fn read_proof_params(path: &str) -> anyhow::Result<Vec<u8>> {
+            std::fs::read(std::path::Path::new(path))
+                .context(format!("Failed to read from {} into memory", path))
+        }
 
-        ProvingParams {
+        let spend = decode_zswap_proof_params(
+            read_proof_params(SPEND_PK_RAW)?,
+            read_proof_params(SPEND_VK_RAW)?,
+            read_proof_params(SPEND_IR_RAW)?,
+        )?;
+        let output = decode_zswap_proof_params(
+            read_proof_params(OUTPUT_PK_RAW)?,
+            read_proof_params(OUTPUT_VK_RAW)?,
+            read_proof_params(OUTPUT_IR_RAW)?,
+        )?;
+        let sign = decode_zswap_proof_params(
+            read_proof_params(SIGN_PK_RAW)?,
+            read_proof_params(SIGN_VK_RAW)?,
+            read_proof_params(SIGN_IR_RAW)?,
+        )?;
+
+        Ok(ProvingParams {
             pp,
             spend,
             output,
             sign,
-        }
+        })
     }
 }
 
 pub async fn balance_and_submit_tx(
     prover_params: &ProvingParams,
+    api: &OnlineClient<SubstrateConfig>,
     base_state: &State,
     tx: &str,
     network_id: NetworkId,
-) -> anyhow::Result<(State, String)> {
+) -> Result<(State, String), Error> {
     let mut state = base_state.clone();
 
-    let api = OnlineClient::<SubstrateConfig>::from_url("ws://127.0.0.1:9944")
-        .await
-        .unwrap();
+    // let ledger_state = midnight::apis().midnight_runtime_api().get_ledger_state();
 
-    let ledger_state = midnight::apis().midnight_runtime_api().get_ledger_state();
+    // let ledger_state = api
+    //     .runtime_api()
+    //     .at_latest()
+    //     .await
+    //     .unwrap()
+    //     .call(ledger_state)
+    //     .await
+    //     .unwrap()
+    //     .unwrap();
 
-    let ledger_state = api
-        .runtime_api()
-        .at_latest()
-        .await
-        .unwrap()
-        .call(ledger_state)
-        .await
-        .unwrap()
-        .unwrap();
+    // let ledger_state: LedgerState = deserialize(Cursor::new(ledger_state), network_id).unwrap();
 
-    let ledger_state: LedgerState = deserialize(Cursor::new(ledger_state), network_id).unwrap();
+    // dbg!(&ledger_state);
 
-    dbg!(&ledger_state);
-
-    assert_eq!(&ledger_state.parameters, &DUMMY_PARAMETERS);
+    // assert_eq!(&ledger_state.parameters, &DUMMY_PARAMETERS);
+    //
+    let parameters = DUMMY_PARAMETERS;
 
     let unbalanced_tx: Transaction<Proof> =
         deserialize(std::io::Cursor::new(hex::decode(tx).unwrap()), network_id).unwrap();
 
-    dbg!(&unbalanced_tx);
+    tracing::trace!(?unbalanced_tx, "unbalanced transaction received");
 
-    let fees = unbalanced_tx.cost(&ledger_state.parameters).unwrap() + 45000;
+    // TODO: this probably only works for a single input and a single output.
+    //
+    // figure out how to generalize
+    let zswap_cost_estimation = 40000;
+    let fees = unbalanced_tx.cost(&parameters).unwrap() + zswap_cost_estimation;
 
     let mut to_spend = vec![];
     let mut curr_balance = 0;
@@ -159,10 +176,15 @@ pub async fn balance_and_submit_tx(
         }
     }
 
+    if curr_balance < fees {
+        return Err(Error::NotAvailable("No funds available".to_string()));
+    }
+
     let mut inputs = vec![];
     for coin in to_spend {
-        // dbg!(&coin);
-        let (new_state, input) = state.spend(&mut OsRng, &coin.1).unwrap();
+        let (new_state, input) = state
+            .spend(&mut OsRng, &coin.1)
+            .map_err(|e| Error::ServerError(e.to_string()))?;
 
         state = new_state;
         inputs.push(input);
@@ -180,13 +202,14 @@ pub async fn balance_and_submit_tx(
             &state.coin_public_key(),
             Some(state.enc_public_key()),
         )
-        .unwrap()],
+        .map_err(|e| Error::ServerError(e.to_string()))?],
         transient: vec![],
         deltas: vec![(NATIVE_TOKEN, fees as i128)],
     };
 
     let balanced_tx = Transaction::new(guaranted_coins, None, None);
 
+    let instant = std::time::Instant::now();
     let balanced_tx = balanced_tx
         .prove(OsRng, &prover_params.pp, |loc| match &*loc.0 {
             "midnight/zswap/spend" => Some(prover_params.spend.clone()),
@@ -195,39 +218,33 @@ pub async fn balance_and_submit_tx(
             _ => unreachable!("this transaction does not have contract calls"),
         })
         .await
-        .unwrap();
+        .map_err(|e| Error::BadRequest(format!("Invalid transaction {}", e)))?;
 
-    let final_tx = balanced_tx.merge(&unbalanced_tx).unwrap();
+    tracing::info!("proved zswap in {} ms", instant.elapsed().as_millis());
 
-    dbg!(final_tx.imbalances(true, Some(fees)));
+    let final_tx = balanced_tx
+        .merge(&unbalanced_tx)
+        .map_err(|e| Error::ServerError(e.to_string()))?;
 
-    dbg!(&final_tx);
-    dbg!(&final_tx.fees(&ledger_state.parameters));
+    // dbg!(&final_tx.fees(&parameters));
 
-    final_tx
-        .well_formed(&ledger_state, WellFormedStrictness::default())
-        .unwrap();
+    // final_tx
+    //     .well_formed(&ledger_state, WellFormedStrictness::default())
+    //     .unwrap();
 
     // panic!();
 
     let mut serialized_final_tx = vec![];
 
-    dbg!("serializing final tx");
     serialize(
         &final_tx,
         std::io::Cursor::new(&mut serialized_final_tx),
         network_id,
     )
-    .unwrap();
+    .map_err(|e| Error::ServerError(e.to_string()))?;
 
     let tx_hash = hex::encode(final_tx.transaction_hash().0 .0);
 
-    println!("tx hash: {}", tx_hash);
-
-    // let api = OnlineClient::<SubstrateConfig>::from_url("wss://rpc.testnet.midnight.network")
-    //     .await
-    //     .unwrap();
-    //
     let hex_tx = hex::encode(serialized_final_tx);
 
     let extrinsic = midnight::tx()
@@ -236,13 +253,23 @@ pub async fn balance_and_submit_tx(
 
     let client = api.tx();
 
-    let submittable = client.create_unsigned(&extrinsic).unwrap();
+    let submittable = client
+        .create_unsigned(&extrinsic)
+        .map_err(|e| Error::ServerError(e.to_string()))?;
 
-    let watch = submittable.submit_and_watch().await.unwrap();
+    let watch = submittable
+        .submit_and_watch()
+        .await
+        .map_err(|e| Error::ServerError(e.to_string()))?;
 
-    let result = watch.wait_for_finalized_success().await.unwrap();
+    let result = watch
+        .wait_for_finalized_success()
+        .await
+        .map_err(|e| Error::ServerError(e.to_string()))?;
 
-    dbg!(result);
+    tracing::info!("transaction submitted: {}", tx_hash);
+
+    // dbg!(result);
 
     Ok((state, tx_hash))
 }

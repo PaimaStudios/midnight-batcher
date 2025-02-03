@@ -1,5 +1,5 @@
 [package]
-name = "midnight-graphql-subscription"
+name = "midnight-batcher"
 version = "0.1.0"
 edition = "2021"
 
@@ -21,27 +21,18 @@ clap = "4.5.27"
 rocket = { version = "0.5.1", features = ["json"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
+rocket_cors = "0.6.0"
 
 midnight-zswap = { path = "../midnight-ledger-prototype/zswap", features = ["offer-construction"] }
 midnight-ledger = { path = "../midnight-ledger-prototype/ledger", features = ["transaction-construction", "verifying", "serde", "transaction-semantics", "proving"] }
 midnight-base-crypto = { path = "../midnight-ledger-prototype/base-crypto" }
-
 midnight-transient-crypto = { git = "https://github.com/input-output-hk/midnight-ledger-prototype", package = "midnight-transient-crypto" }
-
 
 [patch.'https://github.com/input-output-hk/midnight-ledger-prototype']
 midnight-ledger = { path = "../midnight-ledger-prototype/ledger" }
 midnight-zswap = { path = "../midnight-ledger-prototype/zswap" }
 midnight-base-crypto = { path = "../midnight-ledger-prototype/base-crypto" }
 midnight-transient-crypto = { path = "../midnight-ledger-prototype/transient-crypto" }
-
-[patch.'https://github.com/input-output-hk/midnight-foundations']
-coin-structure = { path = "../midnight-foundations/coin-structure", package = "midnight-coin-structure" }
-# base-crypto = { path = "../midnight-foundations/base-crypto", package = 'midnight-base-crypto' }
-serialize = { path = "../midnight-foundations/serialize", package = 'midnight-serialize' }
-
-[patch.'https://github.com/input-output-hk/compactc']
-midnight-onchain-runtime = { path = "../compactc/midnight-onchain-runtime" } 
 
 [dependencies.rusqlite]
 version = "0.32.0"

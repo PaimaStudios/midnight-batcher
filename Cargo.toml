@@ -23,16 +23,21 @@ tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 rocket_cors = "0.6.0"
 
-midnight-zswap = { path = "../midnight-ledger-prototype/zswap", features = ["offer-construction"] }
-midnight-ledger = { path = "../midnight-ledger-prototype/ledger", features = ["transaction-construction", "verifying", "serde", "transaction-semantics", "proving"] }
-midnight-base-crypto = { path = "../midnight-ledger-prototype/base-crypto" }
-midnight-transient-crypto = { git = "https://github.com/input-output-hk/midnight-ledger-prototype", package = "midnight-transient-crypto" }
+midnight-zswap = { path = "./midnight-ledger-prototype/zswap", features = ["offer-construction"] }
+midnight-ledger = { path = "./midnight-ledger-prototype/ledger", features = ["transaction-construction", "verifying", "serde", "transaction-semantics", "proving"] }
+midnight-transient-crypto = { path = "./midnight-ledger-prototype/transient-crypto", package = "midnight-transient-crypto" }
 
-[patch.'https://github.com/input-output-hk/midnight-ledger-prototype']
-midnight-ledger = { path = "../midnight-ledger-prototype/ledger" }
-midnight-zswap = { path = "../midnight-ledger-prototype/zswap" }
-midnight-base-crypto = { path = "../midnight-ledger-prototype/base-crypto" }
-midnight-transient-crypto = { path = "../midnight-ledger-prototype/transient-crypto" }
+# midnight-base-crypto = { git = "https://github.com/input-output-hk/midnight-ledger-prototype", rev = "base-crypto-0.4" }
+
+# [patch.'https://github.com/input-output-hk/midnight-ledger-prototype']
+# midnight-ledger = { path = "./midnight-ledger-prototype/ledger" }
+# midnight-zswap = { path = "./midnight-ledger-prototype/zswap" }
+# midnight-transient-crypto = { path = "./midnight-ledger-prototype/transient-crypto" }
+
+[build-dependencies]
+toml_edit = "0.22.23"
+
+# midnight-base-crypto = { path = "../midnight-ledger-prototype/base-crypto" }
 
 [dependencies.rusqlite]
 version = "0.32.0"

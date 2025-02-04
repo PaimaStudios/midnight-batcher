@@ -338,7 +338,6 @@ async fn wallet_indexer(
 
                 dbg!(&confirmed_state.coins);
                 // dbg!(&confirmed_state.merkle_tree);
-                dbg!(&confirmed_state.merkle_tree.root());
             }
             Ok(_) => {}
             Err(e) => {

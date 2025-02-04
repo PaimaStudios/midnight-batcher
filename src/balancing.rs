@@ -1,9 +1,6 @@
 use crate::{endpoints::Error, midnight};
 use anyhow::Context as _;
-use midnight_ledger::{
-    structure::{LedgerState, Transaction, DUMMY_PARAMETERS},
-    verify::WellFormedStrictness,
-};
+use midnight_ledger::structure::{Transaction, DUMMY_PARAMETERS};
 use midnight_transient_crypto::proofs::{IrSource, ParamsProver, Proof, ProverKey, VerifierKey};
 use midnight_zswap::{
     coin_structure::{self, coin::NATIVE_TOKEN},
@@ -190,8 +187,34 @@ pub async fn balance_and_submit_tx(
         inputs.push(input);
     }
 
-    let guaranted_coins = Offer {
+    let inputs_tx = Offer {
         inputs,
+        outputs: vec![],
+        transient: vec![],
+        deltas: vec![(NATIVE_TOKEN, curr_balance as i128)],
+    };
+
+    let inputs_tx = Transaction::new(inputs_tx, None, None);
+
+    let instant = std::time::Instant::now();
+
+    let inputs_tx = inputs_tx
+        .prove(OsRng, &prover_params.pp, |loc| match &*loc.0 {
+            "midnight/zswap/spend" => Some(prover_params.spend.clone()),
+            "midnight/zswap/output" => Some(prover_params.output.clone()),
+            "midnight/zswap/sign" => Some(prover_params.sign.clone()),
+            _ => unreachable!("this transaction does not have contract calls"),
+        })
+        .await
+        .map_err(|e| Error::BadRequest(format!("Invalid transaction {}", e)))?;
+
+    tracing::info!(
+        "proved inputs zswap in {} ms",
+        instant.elapsed().as_millis()
+    );
+
+    let outputs_tx = Offer {
+        inputs: vec![],
         outputs: vec![Output::new(
             &mut OsRng,
             &coin_structure::coin::Info {
@@ -204,13 +227,14 @@ pub async fn balance_and_submit_tx(
         )
         .map_err(|e| Error::ServerError(e.to_string()))?],
         transient: vec![],
-        deltas: vec![(NATIVE_TOKEN, fees as i128)],
+        deltas: vec![(NATIVE_TOKEN, -(curr_balance as i128) + (fees as i128))],
     };
 
-    let balanced_tx = Transaction::new(guaranted_coins, None, None);
+    let outputs_tx = Transaction::new(outputs_tx, None, None);
 
     let instant = std::time::Instant::now();
-    let balanced_tx = balanced_tx
+
+    let outputs_tx = outputs_tx
         .prove(OsRng, &prover_params.pp, |loc| match &*loc.0 {
             "midnight/zswap/spend" => Some(prover_params.spend.clone()),
             "midnight/zswap/output" => Some(prover_params.output.clone()),
@@ -220,11 +244,18 @@ pub async fn balance_and_submit_tx(
         .await
         .map_err(|e| Error::BadRequest(format!("Invalid transaction {}", e)))?;
 
-    tracing::info!("proved zswap in {} ms", instant.elapsed().as_millis());
+    tracing::info!(
+        "proved outputs zswap in {} ms",
+        instant.elapsed().as_millis()
+    );
 
-    let final_tx = balanced_tx
+    let final_tx = inputs_tx
+        .merge(&outputs_tx)
+        .map_err(|e| Error::ServerError(e.to_string()))?
         .merge(&unbalanced_tx)
         .map_err(|e| Error::ServerError(e.to_string()))?;
+
+    tracing::debug!(?final_tx, "merged transactions");
 
     // dbg!(&final_tx.fees(&parameters));
 
@@ -262,12 +293,14 @@ pub async fn balance_and_submit_tx(
         .await
         .map_err(|e| Error::ServerError(e.to_string()))?;
 
+    tracing::info!(tx_hash, "submitting transaction");
+
     let result = watch
         .wait_for_finalized_success()
         .await
         .map_err(|e| Error::ServerError(e.to_string()))?;
 
-    tracing::info!("transaction submitted: {}", tx_hash);
+    tracing::info!(tx_hash, "transaction submitted");
 
     // dbg!(result);
 

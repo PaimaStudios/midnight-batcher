@@ -3,6 +3,7 @@ use crate::{
     SyncStatus,
 };
 use midnight_zswap::serialize::NetworkId;
+use rand::{rngs::OsRng, Rng};
 use rocket::{
     http::{Method, Status},
     serde::json::Json,
@@ -13,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use subxt::{OnlineClient, SubstrateConfig};
 use tokio::sync::Mutex;
+use tracing::Instrument as _;
 
 struct AppState {
     proving_params: Arc<ProvingParams>,
@@ -47,6 +49,9 @@ async fn submit_tx(
     transaction: Json<Transaction>,
     state: &State<AppState>,
 ) -> Result<Json<Response>, Error> {
+    let span_id: u128 = OsRng.gen();
+    let span = tracing::info_span!("submit_tx request", span_id);
+
     let sync_status = state.sync_status.lock().await;
 
     match *sync_status {
@@ -56,18 +61,16 @@ async fn submit_tx(
         SyncStatus::UpToDate => {}
     }
 
-    let mut zswap_state = state.zswap_state.lock().await;
-
-    let (new_state, tx_hash) = balance_and_submit_tx(
+    let tx_hash = balance_and_submit_tx(
         &state.proving_params,
         &state.api,
-        &zswap_state,
+        Arc::clone(&state.zswap_state),
         &transaction.tx,
         state.network_id,
     )
+    .instrument(span)
     .await?;
 
-    *zswap_state = new_state;
     Ok(Json(Response { tx_hash }))
 }
 

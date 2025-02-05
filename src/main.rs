@@ -276,8 +276,11 @@ async fn wallet_indexer(
                     gql::TransactionOrUpdate::TransactionAdded(tx_added) => tx_added.transaction,
                     gql::TransactionOrUpdate::ProgressUpdate(pu) => {
                         let mut sync_status = sync_status.lock().await;
-                        if pu.synced == pu.total {
-                            tracing::info!("wallet state up to date");
+                        if (pu.synced / pu.total) > 0.95 {
+                            if !matches!(*sync_status, SyncStatus::UpToDate) {
+                                tracing::info!("wallet state up to date");
+                            }
+
                             *sync_status = SyncStatus::UpToDate;
                         } else {
                             tracing::info!("progress update: {}/{}", pu.synced, pu.total);
@@ -316,7 +319,7 @@ async fn wallet_indexer(
                 let mut unconfirmed_state_guard = latest_state.lock().await;
                 let mut unconfirmed_state = unconfirmed_state_guard.clone();
 
-                tracing::info!("processing tx: {:#?}", &tx);
+                tracing::info!("received tx: {:#?}", &tx);
 
                 match tx {
                     Transaction::Standard(stx) => {

@@ -71,12 +71,18 @@ async fn main() -> anyhow::Result<()> {
                 .value_parser(["testnet", "undeployed"])
                 .default_value("undeployed"),
         )
+        .arg(
+            arg!(--db <PATH>)
+                .value_parser(clap::value_parser!(PathBuf))
+                .default_value("./db.sqlite"),
+        )
         .get_matches();
 
     let indexer = matches.get_one::<String>("indexer").expect("default");
     let node = matches.get_one::<String>("node").expect("default");
     let credentials = matches.get_one::<PathBuf>("secret").expect("default");
     let network = matches.get_one::<String>("network").expect("default");
+    let db = matches.get_one::<PathBuf>("db").expect("default");
 
     info!("URLs: {:?}", indexer);
     info!("File path: {:?}", node);
@@ -93,11 +99,11 @@ async fn main() -> anyhow::Result<()> {
         _ => anyhow::bail!("invalid network"),
     };
 
-    let url = Url::parse(INDEXER_LOCALHOST).expect("Invalid indexer URL");
+    let url = Url::parse(indexer).expect("Invalid indexer URL");
 
     let proving_params = ProvingParams::new()?;
 
-    let db = Db::open_db("db.sqlite", network_id)?;
+    let db = Db::open_db(db, network_id)?;
 
     let seed = std::fs::read_to_string(credentials).context("Failed to read credentials")?;
 

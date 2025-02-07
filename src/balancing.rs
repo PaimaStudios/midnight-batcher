@@ -1,9 +1,11 @@
-use crate::{endpoints::Error, midnight};
+use crate::{
+    endpoints::Error,
+    midnight::{self},
+    preproofing::PreProvingServiceChannelTx,
+};
 use anyhow::Context as _;
 use midnight_ledger::structure::{Transaction, DUMMY_PARAMETERS};
-use midnight_transient_crypto::proofs::{
-    IrSource, ParamsProver, Proof, ProofPreimage, ProverKey, VerifierKey,
-};
+use midnight_transient_crypto::proofs::{IrSource, ParamsProver, Proof, ProverKey, VerifierKey};
 use midnight_zswap::{
     coin_structure::{self, coin::NATIVE_TOKEN},
     local::State,
@@ -83,15 +85,18 @@ pub fn read_kzg_params() -> anyhow::Result<ParamsProver> {
 }
 
 pub struct ProvingParams {
-    pp: ParamsProver,
-    spend: (ProverKey, VerifierKey, IrSource),
-    output: (ProverKey, VerifierKey, IrSource),
-    sign: (ProverKey, VerifierKey, IrSource),
+    pub pp: ParamsProver,
+    pub spend: (ProverKey, VerifierKey, IrSource),
+    pub output: (ProverKey, VerifierKey, IrSource),
+    pub sign: (ProverKey, VerifierKey, IrSource),
 }
 
 impl ProvingParams {
     pub fn new() -> anyhow::Result<Self> {
-        let pp = read_kzg_params()?;
+        // we only need to prove spend, output and sign, so we can downsize this
+        // to the minimum of those.
+        let min_k = 15;
+        let pp = read_kzg_params()?.downsize(min_k);
 
         fn read_proof_params(path: &str) -> anyhow::Result<Vec<u8>> {
             std::fs::read(std::path::Path::new(path))
@@ -103,16 +108,24 @@ impl ProvingParams {
             read_proof_params(SPEND_VK_RAW)?,
             read_proof_params(SPEND_IR_RAW)?,
         )?;
+
+        // info!("spend k: {}", spend.2.model(None).k());
+
         let output = decode_zswap_proof_params(
             read_proof_params(OUTPUT_PK_RAW)?,
             read_proof_params(OUTPUT_VK_RAW)?,
             read_proof_params(OUTPUT_IR_RAW)?,
         )?;
+
+        // info!("output k: {}", output.2.model(None).k());
+
         let sign = decode_zswap_proof_params(
             read_proof_params(SIGN_PK_RAW)?,
             read_proof_params(SIGN_VK_RAW)?,
             read_proof_params(SIGN_IR_RAW)?,
         )?;
+
+        // info!("sign k: {}", output.2.model(None).k());
 
         Ok(ProvingParams {
             pp,
@@ -129,28 +142,11 @@ pub async fn balance_and_submit_tx(
     base_state: Arc<Mutex<State>>,
     tx: &str,
     network_id: NetworkId,
-) -> Result<String, Error> {
-    // let mut state = base_state.clone();
+    inputs_service: PreProvingServiceChannelTx,
+) -> Result<(String, Vec<String>), Error> {
     let mut state_guard = base_state.lock().await;
 
-    // let ledger_state = midnight::apis().midnight_runtime_api().get_ledger_state();
-
-    // let ledger_state = api
-    //     .runtime_api()
-    //     .at_latest()
-    //     .await
-    //     .unwrap()
-    //     .call(ledger_state)
-    //     .await
-    //     .unwrap()
-    //     .unwrap();
-
-    // let ledger_state: LedgerState = deserialize(Cursor::new(ledger_state), network_id).unwrap();
-
-    // dbg!(&ledger_state);
-
-    // assert_eq!(&ledger_state.parameters, &DUMMY_PARAMETERS);
-    //
+    // TODO: we should fetch this from the ledger state, but this works right now anyway.
     let parameters = DUMMY_PARAMETERS;
 
     let unbalanced_tx: Transaction<Proof> =
@@ -177,8 +173,6 @@ pub async fn balance_and_submit_tx(
 
     // always pick the biggest unused utxo first, to spend evenly from the pool.
     sorted_coins.sort_by_key(|(_, coin)| Reverse(coin.value));
-
-    dbg!(&sorted_coins);
 
     for coin in sorted_coins {
         curr_balance += coin.1.value;
@@ -213,15 +207,26 @@ pub async fn balance_and_submit_tx(
 
     std::mem::drop(state_guard);
 
-    let inputs_offer = Offer {
-        inputs,
-        outputs: vec![],
-        transient: vec![],
-        deltas: vec![(NATIVE_TOKEN, curr_balance as i128)],
-    };
+    let (inputs_tx, inputs_rx) = tokio::sync::oneshot::channel();
+    inputs_service
+        .send((
+            inputs.iter().map(|input| input.nullifier).collect(),
+            inputs_tx,
+        ))
+        .await
+        .map_err(|e| Error::ServerError(e.to_string()))?;
 
-    let tx_hash = prove_and_submit(
-        inputs_offer.clone(),
+    let proven_inputs = inputs_rx.await.unwrap();
+
+    let inputs_tx = proven_inputs
+        .into_iter()
+        .map(Ok)
+        .reduce(|tx1, tx2| tx1?.merge(&tx2?))
+        .ok_or_else(|| Error::ServerError("pre-computed proofs are empty".to_string()))?
+        .map_err(|e| Error::ServerError(e.to_string()))?;
+
+    let tx_ids = prove_and_submit(
+        inputs_tx.clone(),
         curr_balance,
         fees,
         prover_params,
@@ -235,13 +240,18 @@ pub async fn balance_and_submit_tx(
     )
     .await;
 
-    if tx_hash.is_err() {
-        base_state.lock().await.apply_failed(&inputs_offer);
+    if tx_ids.is_err() {
+        match inputs_tx {
+            Transaction::Standard(standard_transaction) => {
+                let inputs_offer = standard_transaction.guaranteed_coins;
+
+                base_state.lock().await.apply_failed(&inputs_offer);
+            }
+            Transaction::ClaimMint(_) => (),
+        }
     }
 
-    // dbg!(result);
-
-    tx_hash
+    tx_ids
 }
 
 struct PublicKeys {
@@ -250,7 +260,7 @@ struct PublicKeys {
 }
 
 async fn prove_and_submit(
-    inputs_offer: Offer<ProofPreimage>,
+    inputs_tx: Transaction<Proof>,
     curr_balance: u128,
     fees: u128,
     prover_params: &ProvingParams,
@@ -258,25 +268,7 @@ async fn prove_and_submit(
     unbalanced_tx: Transaction<Proof>,
     network_id: NetworkId,
     api: &OnlineClient<SubstrateConfig>,
-) -> Result<String, Error> {
-    let inputs_tx = Transaction::new(inputs_offer, None, None);
-
-    let instant = std::time::Instant::now();
-    let inputs_tx = inputs_tx
-        .prove(OsRng, &prover_params.pp, |loc| match &*loc.0 {
-            "midnight/zswap/spend" => Some(prover_params.spend.clone()),
-            "midnight/zswap/output" => Some(prover_params.output.clone()),
-            "midnight/zswap/sign" => Some(prover_params.sign.clone()),
-            _ => unreachable!("this transaction does not have contract calls"),
-        })
-        .await
-        .map_err(|e| Error::BadRequest(format!("Invalid transaction {}", e)))?;
-
-    tracing::info!(
-        "proved inputs zswap in {} ms",
-        instant.elapsed().as_millis()
-    );
-
+) -> Result<(String, Vec<String>), Error> {
     let value = curr_balance - fees;
 
     let outputs_offer_tx = Offer {
@@ -293,8 +285,9 @@ async fn prove_and_submit(
         )
         .map_err(|e| Error::ServerError(e.to_string()))?],
         transient: vec![],
-        deltas: vec![(NATIVE_TOKEN, -(value as i128))],
+        deltas: vec![(NATIVE_TOKEN, fees as i128)],
     };
+
     let outputs_tx = Transaction::new(outputs_offer_tx, None, None);
 
     let instant = std::time::Instant::now();
@@ -320,8 +313,6 @@ async fn prove_and_submit(
         .merge(&unbalanced_tx)
         .map_err(|e| Error::ServerError(e.to_string()))?;
 
-    tracing::debug!(?final_tx, "merged transactions");
-
     let mut serialized_final_tx = vec![];
 
     serialize(
@@ -332,11 +323,28 @@ async fn prove_and_submit(
     .map_err(|e| Error::ServerError(e.to_string()))?;
 
     let tx_hash = hex::encode(final_tx.transaction_hash().0 .0);
+
+    let identifiers = final_tx
+        .identifiers()
+        .map(|id| {
+            let mut buf = vec![];
+            serialize(&id, std::io::Cursor::new(&mut buf), network_id).map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to serialize transaction identifier, reason: {}",
+                    error
+                )
+            })?;
+            Ok(hex::encode(buf))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map_err(|e| Error::ServerError(e.to_string()))?;
+
     let hex_tx = hex::encode(serialized_final_tx);
 
     let extrinsic = midnight::tx()
         .midnight()
         .send_mn_transaction(hex_tx.as_bytes().to_vec());
+
     let client = api.tx();
 
     let submittable = client
@@ -350,11 +358,39 @@ async fn prove_and_submit(
 
     tracing::info!(tx_hash, "submitting transaction");
 
-    let result = watch
-        .wait_for_finalized_success()
+    let now = std::time::Instant::now();
+
+    let in_tx_block = watch
+        .wait_for_finalized()
         .await
         .map_err(|e| Error::ServerError(e.to_string()))?;
-    tracing::info!(tx_hash, "transaction submitted");
 
-    Ok(tx_hash)
+    tracing::info!(
+        tx_hash,
+        "transaction submitted took {} ms",
+        now.elapsed().as_millis()
+    );
+
+    // if let Ok(block) = api
+    //     .blocks()
+    //     .at(BlockRef::from_hash(in_tx_block.block_hash()))
+    //     .await
+    // {
+    //     tracing::info!("transaction included in {:?}", block.header());
+    // }
+
+    let now = std::time::Instant::now();
+
+    let _result = in_tx_block
+        .wait_for_success()
+        .await
+        .map_err(|e| Error::ServerError(e.to_string()))?;
+
+    tracing::info!(
+        tx_hash,
+        "transaction submitted, confirmation took {} ms",
+        now.elapsed().as_millis()
+    );
+
+    Ok((tx_hash, identifiers))
 }

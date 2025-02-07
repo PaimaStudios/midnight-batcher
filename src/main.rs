@@ -4,6 +4,7 @@ extern crate rocket;
 mod balancing;
 mod db;
 mod endpoints;
+mod preproofing;
 
 use anyhow::Context as _;
 use balancing::ProvingParams;
@@ -14,6 +15,7 @@ use midnight_ledger::structure::Transaction;
 use midnight_transient_crypto::proofs::Proof;
 use midnight_zswap::local::State;
 use midnight_zswap::serialize::{deserialize, serialize, NetworkId};
+use preproofing::pre_proving_service;
 use rand::SeedableRng as _;
 use rand_chacha::ChaCha20Rng;
 use serde_json::json;
@@ -35,7 +37,10 @@ const NODE_LOCALHOST: &str = "ws://127.0.0.1:9944";
 pub mod midnight {}
 
 pub enum SyncStatus {
-    Syncing { progress: f64 },
+    Syncing {
+        progress: f64,
+        notify: Option<Arc<tokio::sync::Notify>>,
+    },
     UpToDate,
 }
 
@@ -101,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
 
     let url = Url::parse(indexer).expect("Invalid indexer URL");
 
-    let proving_params = ProvingParams::new()?;
+    let proving_params = Arc::new(ProvingParams::new()?);
 
     let db = Db::open_db(db, network_id)?;
 
@@ -125,9 +130,14 @@ async fn main() -> anyhow::Result<()> {
 
     let current_tx = maybe_latest_state.map(|(hash, _)| hash);
 
-    let sync_status = Arc::new(Mutex::new(SyncStatus::Syncing { progress: 0.0 }));
+    let sync_status = Arc::new(Mutex::new(SyncStatus::Syncing {
+        progress: 0.0,
+        notify: None,
+    }));
 
     let initial_state = Arc::new(Mutex::new(initial_state));
+
+    let notify_tx = Arc::new(tokio::sync::Notify::new());
 
     tokio::task::spawn(wallet_indexer(
         db,
@@ -136,12 +146,30 @@ async fn main() -> anyhow::Result<()> {
         current_tx,
         network_id,
         Arc::clone(&sync_status),
+        Arc::clone(&notify_tx),
     ));
 
-    endpoints::rocket(proving_params, api, initial_state, network_id, sync_status)
-        .launch()
-        .await
-        .unwrap();
+    let (pre_proving_comm_tx, pre_proving_comm_rx) = tokio::sync::mpsc::channel(1000);
+
+    tokio::task::spawn(pre_proving_service(
+        Arc::clone(&initial_state),
+        Arc::clone(&proving_params),
+        notify_tx,
+        pre_proving_comm_rx,
+        Arc::clone(&sync_status),
+    ));
+
+    endpoints::rocket(
+        proving_params,
+        api,
+        initial_state,
+        network_id,
+        sync_status,
+        pre_proving_comm_tx,
+    )
+    .launch()
+    .await
+    .unwrap();
 
     Ok(())
 }
@@ -153,6 +181,7 @@ async fn wallet_indexer(
     current_tx: Option<String>,
     network_id: NetworkId,
     sync_status: Arc<Mutex<SyncStatus>>,
+    signal: Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<()> {
     // There is no pending state initially
     //
@@ -277,8 +306,12 @@ async fn wallet_indexer(
                     gql::TransactionOrUpdate::ProgressUpdate(pu) => {
                         let mut sync_status = sync_status.lock().await;
                         if (pu.synced / pu.total) > 0.95 {
-                            if !matches!(*sync_status, SyncStatus::UpToDate) {
-                                tracing::info!("wallet state up to date");
+                            if let SyncStatus::Syncing {
+                                progress: _,
+                                notify: Some(notify),
+                            } = &*sync_status
+                            {
+                                notify.notify_one();
                             }
 
                             *sync_status = SyncStatus::UpToDate;
@@ -286,6 +319,7 @@ async fn wallet_indexer(
                             tracing::info!("progress update: {}/{}", pu.synced, pu.total);
                             *sync_status = SyncStatus::Syncing {
                                 progress: (pu.synced / pu.total) * 100.0,
+                                notify: None,
                             };
                         }
 
@@ -319,8 +353,6 @@ async fn wallet_indexer(
                 let mut unconfirmed_state_guard = latest_state.lock().await;
                 let mut unconfirmed_state = unconfirmed_state_guard.clone();
 
-                tracing::info!("received tx: {:#?}", &tx);
-
                 match tx {
                     Transaction::Standard(stx) => {
                         confirmed_state = confirmed_state.apply(&stx.guaranteed_coins);
@@ -342,6 +374,8 @@ async fn wallet_indexer(
                 if current_coins == confirmed_state.coins {
                     continue;
                 }
+
+                signal.notify_waiters();
 
                 db.persist_state(STABLE_STATE_ID, &tx_hash, &confirmed_state)?;
 

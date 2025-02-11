@@ -1,7 +1,9 @@
 use crate::{
+    db::Db,
     endpoints::Error,
     midnight::{self},
     preproofing::PreProvingServiceChannelTx,
+    whitelisting::{self, check_call, check_deploy},
 };
 use anyhow::Context as _;
 use midnight_ledger::structure::{Transaction, DUMMY_PARAMETERS};
@@ -136,6 +138,7 @@ impl ProvingParams {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn balance_and_submit_tx(
     prover_params: &ProvingParams,
     api: &OnlineClient<SubstrateConfig>,
@@ -143,9 +146,9 @@ pub async fn balance_and_submit_tx(
     tx: &str,
     network_id: NetworkId,
     inputs_service: PreProvingServiceChannelTx,
+    whitelisting: &Option<whitelisting::Constraints>,
+    db: &Db,
 ) -> Result<(String, Vec<String>), Error> {
-    let mut state_guard = base_state.lock().await;
-
     // TODO: we should fetch this from the ledger state, but this works right now anyway.
     let parameters = DUMMY_PARAMETERS;
 
@@ -154,11 +157,37 @@ pub async fn balance_and_submit_tx(
 
     tracing::trace!(?unbalanced_tx, "unbalanced transaction received");
 
+    assert!(whitelisting.is_some());
+
+    if let Some(constraints) = whitelisting {
+        tracing::info!("validations");
+
+        let is_call_to_known_contract = check_call(db, &unbalanced_tx, network_id)
+            .map_err(|e| Error::ServerError(e.to_string()))?;
+
+        if !is_call_to_known_contract {
+            let deploy = check_deploy(constraints, &unbalanced_tx, network_id)
+                .map_err(|e| Error::ServerError(e.to_string()))?;
+
+            if let Some(address) = &deploy {
+                tracing::info!(address, "received new contract deploy");
+            } else {
+                return Err(Error::BadRequest("Transaction not allowed".to_string()));
+            }
+        }
+    }
+
+    let mut state_guard = base_state.lock().await;
+
     // TODO: this probably only works for a single input and a single output.
     //
     // figure out how to generalize
     let zswap_cost_estimation = 40000;
-    let fees = unbalanced_tx.cost(&parameters).unwrap() + zswap_cost_estimation;
+    let cost = unbalanced_tx
+        .cost(&parameters)
+        .map_err(|e| Error::ServerError(e.to_string()))?;
+
+    let fees = cost + zswap_cost_estimation;
 
     let mut to_spend = vec![];
     let mut curr_balance = 0;

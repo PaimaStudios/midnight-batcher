@@ -26,6 +26,7 @@ rocket_cors = "0.6.0"
 midnight-zswap = { path = "./midnight-ledger-prototype/zswap", features = ["offer-construction"] }
 midnight-ledger = { path = "./midnight-ledger-prototype/ledger", features = ["transaction-construction", "verifying", "serde", "transaction-semantics", "proving"] }
 midnight-transient-crypto = { path = "./midnight-ledger-prototype/transient-crypto", package = "midnight-transient-crypto" }
+sha256 = "1.5.0"
 
 # midnight-base-crypto = { git = "https://github.com/input-output-hk/midnight-ledger-prototype", rev = "base-crypto-0.4" }
 

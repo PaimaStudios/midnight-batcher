@@ -1,7 +1,8 @@
 use crate::{
     balancing::{balance_and_submit_tx, ProvingParams},
+    db::Db,
     preproofing::PreProvingServiceChannelTx,
-    SyncStatus,
+    whitelisting, SyncStatus,
 };
 use midnight_zswap::serialize::NetworkId;
 use rand::{rngs::OsRng, Rng};
@@ -20,6 +21,8 @@ struct AppState {
     sync_status: Arc<Mutex<SyncStatus>>,
     api: OnlineClient<SubstrateConfig>,
     inputs_service: PreProvingServiceChannelTx,
+    whitelisting: Arc<Option<whitelisting::Constraints>>,
+    db: Db,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +73,8 @@ async fn submit_tx(
         &transaction.tx,
         state.network_id,
         state.inputs_service.clone(),
+        &state.whitelisting,
+        &state.db,
     )
     .instrument(span.clone())
     .await?;
@@ -87,6 +92,7 @@ async fn submit_tx(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn rocket(
     prover_params: Arc<ProvingParams>,
     api: OnlineClient<SubstrateConfig>,
@@ -94,6 +100,8 @@ pub fn rocket(
     network_id: NetworkId,
     sync_status: Arc<Mutex<SyncStatus>>,
     inputs_service: PreProvingServiceChannelTx,
+    whitelisting: Option<whitelisting::Constraints>,
+    db: Db,
 ) -> rocket::Rocket<rocket::Build> {
     let state = AppState {
         proving_params: prover_params,
@@ -102,6 +110,8 @@ pub fn rocket(
         network_id,
         sync_status,
         inputs_service,
+        whitelisting: Arc::new(whitelisting),
+        db,
     };
 
     let cors = CorsOptions::default()

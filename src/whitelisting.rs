@@ -6,9 +6,9 @@ use midnight_ledger::{
 };
 use midnight_transient_crypto::proofs::{Proof, VerifierKey};
 use midnight_zswap::serialize::{deserialize, serialize, NetworkId};
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
-pub type Constraints = HashMap<EntryPointBuf, VerifierKey>;
+pub type Constraints = Arc<HashMap<EntryPointBuf, VerifierKey>>;
 
 pub fn read_constraints(
     dir: impl AsRef<Path>,
@@ -42,7 +42,7 @@ pub fn read_constraints(
         }
     }
 
-    Ok(res)
+    Ok(Arc::new(res))
 }
 
 pub fn check_call(db: &Db, tx: &Transaction<Proof>, network_id: NetworkId) -> anyhow::Result<bool> {

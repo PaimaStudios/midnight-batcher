@@ -153,7 +153,13 @@ pub async fn balance_and_submit_tx(
     let parameters = DUMMY_PARAMETERS;
 
     let unbalanced_tx: Transaction<Proof> =
-        deserialize(std::io::Cursor::new(hex::decode(tx).unwrap()), network_id).unwrap();
+        deserialize(
+            std::io::Cursor::new(hex::decode(tx).map_err(|_| {
+                Error::BadRequest("Transaction payload is not valid hex".to_string())
+            })?),
+            network_id,
+        )
+        .map_err(|e| Error::BadRequest(format!("Invalid transaction. Error: {}", e)))?;
 
     tracing::trace!(?unbalanced_tx, "unbalanced transaction received");
 
@@ -162,12 +168,11 @@ pub async fn balance_and_submit_tx(
     if let Some(constraints) = whitelisting {
         tracing::info!("validations");
 
-        let is_call_to_known_contract = check_call(db, &unbalanced_tx, network_id)
-            .map_err(|e| Error::ServerError(e.to_string()))?;
+        let is_call_to_known_contract = check_call(db, &unbalanced_tx, network_id)?;
+        // .map_err(|e| Error::InternalError(e.to_string()))?;
 
         if !is_call_to_known_contract {
-            let deploy = check_deploy(constraints, &unbalanced_tx, network_id)
-                .map_err(|e| Error::ServerError(e.to_string()))?;
+            let deploy = check_deploy(constraints, &unbalanced_tx, network_id)?;
 
             if let Some(address) = &deploy {
                 tracing::info!(address, "received new contract deploy");
@@ -185,7 +190,7 @@ pub async fn balance_and_submit_tx(
     let zswap_cost_estimation = 40000;
     let cost = unbalanced_tx
         .cost(&parameters)
-        .map_err(|e| Error::ServerError(e.to_string()))?;
+        .map_err(|e| Error::InternalError(e.to_string()))?;
 
     let fees = cost + zswap_cost_estimation;
 
@@ -225,7 +230,7 @@ pub async fn balance_and_submit_tx(
     for coin in to_spend {
         let (new_state, input) = state_guard
             .spend(&mut OsRng, &coin.1)
-            .map_err(|e| Error::ServerError(e.to_string()))?;
+            .map_err(|e| Error::InternalError(e.to_string()))?;
 
         *state_guard = new_state;
         inputs.push(input);
@@ -243,7 +248,7 @@ pub async fn balance_and_submit_tx(
             inputs_tx,
         ))
         .await
-        .map_err(|e| Error::ServerError(e.to_string()))?;
+        .map_err(|e| Error::InternalError(e.to_string()))?;
 
     let proven_inputs = inputs_rx.await.unwrap();
 
@@ -251,8 +256,8 @@ pub async fn balance_and_submit_tx(
         .into_iter()
         .map(Ok)
         .reduce(|tx1, tx2| tx1?.merge(&tx2?))
-        .ok_or_else(|| Error::ServerError("pre-computed proofs are empty".to_string()))?
-        .map_err(|e| Error::ServerError(e.to_string()))?;
+        .ok_or_else(|| Error::InternalError("pre-computed proofs are empty".to_string()))?
+        .map_err(|e| Error::InternalError(e.to_string()))?;
 
     let tx_ids = prove_and_submit(
         inputs_tx.clone(),
@@ -288,6 +293,7 @@ struct PublicKeys {
     enc_public_key: midnight_transient_crypto::encryption::PublicKey,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prove_and_submit(
     inputs_tx: Transaction<Proof>,
     curr_balance: u128,
@@ -312,7 +318,7 @@ async fn prove_and_submit(
             &public_keys.coin_public_key,
             Some(public_keys.enc_public_key),
         )
-        .map_err(|e| Error::ServerError(e.to_string()))?],
+        .map_err(|e| Error::InternalError(e.to_string()))?],
         transient: vec![],
         deltas: vec![(NATIVE_TOKEN, fees as i128)],
     };
@@ -338,9 +344,9 @@ async fn prove_and_submit(
 
     let final_tx = inputs_tx
         .merge(&outputs_tx)
-        .map_err(|e| Error::ServerError(e.to_string()))?
+        .map_err(|e| Error::InternalError(e.to_string()))?
         .merge(&unbalanced_tx)
-        .map_err(|e| Error::ServerError(e.to_string()))?;
+        .map_err(|e| Error::InternalError(e.to_string()))?;
 
     let mut serialized_final_tx = vec![];
 
@@ -349,7 +355,7 @@ async fn prove_and_submit(
         std::io::Cursor::new(&mut serialized_final_tx),
         network_id,
     )
-    .map_err(|e| Error::ServerError(e.to_string()))?;
+    .map_err(|e| Error::InternalError(e.to_string()))?;
 
     let tx_hash = hex::encode(final_tx.transaction_hash().0 .0);
 
@@ -366,7 +372,7 @@ async fn prove_and_submit(
             Ok(hex::encode(buf))
         })
         .collect::<anyhow::Result<Vec<_>>>()
-        .map_err(|e| Error::ServerError(e.to_string()))?;
+        .map_err(|e| Error::InternalError(e.to_string()))?;
 
     let hex_tx = hex::encode(serialized_final_tx);
 
@@ -378,12 +384,12 @@ async fn prove_and_submit(
 
     let submittable = client
         .create_unsigned(&extrinsic)
-        .map_err(|e| Error::ServerError(e.to_string()))?;
+        .map_err(|e| Error::InternalError(e.to_string()))?;
 
     let watch = submittable
         .submit_and_watch()
         .await
-        .map_err(|e| Error::ServerError(e.to_string()))?;
+        .map_err(|e| Error::InternalError(e.to_string()))?;
 
     tracing::info!(tx_hash, "submitting transaction");
 
@@ -392,7 +398,7 @@ async fn prove_and_submit(
     let in_tx_block = watch
         .wait_for_finalized()
         .await
-        .map_err(|e| Error::ServerError(e.to_string()))?;
+        .map_err(|e| Error::InternalError(e.to_string()))?;
 
     tracing::info!(
         tx_hash,
@@ -400,20 +406,12 @@ async fn prove_and_submit(
         now.elapsed().as_millis()
     );
 
-    // if let Ok(block) = api
-    //     .blocks()
-    //     .at(BlockRef::from_hash(in_tx_block.block_hash()))
-    //     .await
-    // {
-    //     tracing::info!("transaction included in {:?}", block.header());
-    // }
-
     let now = std::time::Instant::now();
 
     let _result = in_tx_block
         .wait_for_success()
         .await
-        .map_err(|e| Error::ServerError(e.to_string()))?;
+        .map_err(|e| Error::InternalError(e.to_string()))?;
 
     tracing::info!(
         tx_hash,

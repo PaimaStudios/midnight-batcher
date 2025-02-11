@@ -146,17 +146,40 @@ async fn main() -> anyhow::Result<()> {
 
     let notify_tx = Arc::new(tokio::sync::Notify::new());
 
-    tokio::task::spawn(wallet_indexer(
-        db.clone(),
-        url,
-        Arc::clone(&initial_state),
-        current_tx,
-        network_id,
-        Arc::clone(&sync_status),
-        Arc::clone(&notify_tx),
-        // TODO: maybe this is too big? but shouldn't be
-        whitelisting.clone(),
-    ));
+    {
+        let initial_state = Arc::clone(&initial_state);
+        let sync_status = Arc::clone(&sync_status);
+        let notify_tx = Arc::clone(&notify_tx);
+        let whitelisting = whitelisting.clone();
+        let db = db.clone();
+
+        tokio::task::spawn(async move {
+            let sleep_time = std::time::Duration::from_secs(60);
+
+            loop {
+                let err = wallet_indexer(
+                    db.clone(),
+                    url.clone(),
+                    Arc::clone(&initial_state),
+                    current_tx.clone(),
+                    network_id,
+                    Arc::clone(&sync_status),
+                    Arc::clone(&notify_tx),
+                    // TODO: maybe this is too big? but shouldn't be
+                    whitelisting.clone(),
+                )
+                .await;
+
+                let Err(error) = err else {
+                    unreachable!("indexer task returned without error");
+                };
+
+                tracing::error!(reason=%error, "sync task stopped");
+
+                tokio::time::sleep(sleep_time).await;
+            }
+        });
+    }
 
     let (pre_proving_comm_tx, pre_proving_comm_rx) = tokio::sync::mpsc::channel(1000);
 
@@ -202,6 +225,7 @@ async fn wallet_indexer(
     let mut confirmed_state = latest_state.lock().await.clone();
 
     let mut req = url.into_client_request().unwrap();
+
     req.headers_mut().insert(
         "Sec-WebSocket-Protocol",
         HeaderValue::from_static("graphql-ws"),
@@ -225,11 +249,11 @@ async fn wallet_indexer(
         .await
         .expect("Failed to send init message");
 
-    let message = read.next().await.unwrap().unwrap();
+    let _message = read.next().await.unwrap().unwrap();
 
-    if let tungstenite::Message::Text(text) = message {
-        println!("Received?: {}", text);
-    }
+    // if let tungstenite::Message::Text(text) = message {
+    //     println!("Received?: {}", text);
+    // }
 
     let _message = read.next().await.unwrap().unwrap();
 
@@ -402,7 +426,7 @@ async fn wallet_indexer(
 
                 db.persist_state(STABLE_STATE_ID, &tx_hash, &confirmed_state)?;
 
-                dbg!(&confirmed_state.coins);
+                // dbg!(&confirmed_state.coins);
                 // dbg!(&confirmed_state.merkle_tree);
             }
             Ok(_) => {}

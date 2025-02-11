@@ -41,9 +41,16 @@ pub enum Error {
     #[response(status = 400)]
     BadRequest(String),
     #[response(status = 500)]
-    ServerError(String),
+    #[allow(clippy::enum_variant_names)]
+    InternalError(String),
     #[response(status = 503)]
     NotAvailable(String),
+}
+
+impl From<anyhow::Error> for Error {
+    fn from(value: anyhow::Error) -> Self {
+        Self::InternalError(value.to_string())
+    }
 }
 
 #[post("/submitTx", format = "json", data = "<transaction>")]

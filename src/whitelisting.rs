@@ -14,7 +14,7 @@ pub fn read_constraints(
     dir: impl AsRef<Path>,
     network_id: NetworkId,
 ) -> anyhow::Result<Constraints> {
-    let mut res = Constraints::default();
+    let mut res = HashMap::default();
 
     let dir = std::fs::read_dir(dir.as_ref()).context("Failed to read keys directory")?;
 

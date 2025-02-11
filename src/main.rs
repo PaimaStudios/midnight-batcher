@@ -200,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
         pre_proving_comm_tx,
         whitelisting,
         db,
+        address,
     )
     .launch()
     .await

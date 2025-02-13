@@ -163,8 +163,6 @@ pub async fn balance_and_submit_tx(
 
     tracing::trace!(?unbalanced_tx, "unbalanced transaction received");
 
-    assert!(whitelisting.is_some());
-
     if let Some(constraints) = whitelisting {
         tracing::info!("validations");
 

@@ -1,0 +1,50 @@
+services:
+  proof-server:
+    container_name: 'midnight-local-proof-server-070'
+    image: 'midnightnetwork/proof-server:3.0.2'
+    logging:
+        driver: none
+    ports:
+      - "6300:6300"
+    environment:
+      RUST_BACKTRACE: "full"
+      RUST_LOG: "trace,actix_web::middleware::logger=debug,actix_web=debug"
+  indexer:
+    container_name: 'midnight-local-indexer-070'
+    image: 'midnightnetwork/midnight-pubsub-indexer:2.3.0'
+    platform: linux/amd64
+    ports:
+      - '8088:8088'
+    command: ['-Dlogback.configurationFile=logback-json-file.xml']
+    environment:
+      LOG_LEVEL: 'WARN'
+      LEDGER_NETWORK_ID: 'Undeployed'
+      SUBSTRATE_NODE_WS_URL: 'ws://node:9944'
+      OTEL_JAVAAGENT_ENABLED: 'false'
+    healthcheck:
+      test: ['CMD', 'egrep', '"Block .* was stored at height 0"', '/tmp/app_logs/server.log']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    depends_on:
+      node:
+        condition: service_started
+  node:
+    image: 'midnightnetwork/midnight-node:0.7.0'
+    platform: linux/amd64
+    container_name: 'midnight-local-node-070'
+    ports:
+      - "9944:9944"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9944/health" ]
+      interval: 2s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    environment:
+      CFG_PRESET: "dev"
+    volumes:
+      - midnight-data-undeployed:/node
+
+volumes:
+  midnight-data-undeployed: {}

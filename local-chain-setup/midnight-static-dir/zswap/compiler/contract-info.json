@@ -1,0 +1,263 @@
+{
+  "circuits": [
+    {
+      "name": "spend",
+      "pure": false,
+      "arguments": [
+        {
+          "name": "sk",
+          "type": {
+            "type-name": "Struct",
+            "name": "Either",
+            "elements": [
+              {
+                "name": "is_left",
+                "type": {
+                  "type-name": "Boolean"
+                }
+              },
+              {
+                "name": "left",
+                "type": {
+                  "type-name": "Struct",
+                  "name": "ZswapCoinSecretKey",
+                  "elements": [
+                    {
+                      "name": "bytes",
+                      "type": {
+                        "type-name": "Bytes",
+                        "length": 32
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "right",
+                "type": {
+                  "type-name": "Struct",
+                  "name": "ContractAddress",
+                  "elements": [
+                    {
+                      "name": "bytes",
+                      "type": {
+                        "type-name": "Bytes",
+                        "length": 32
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "path",
+          "type": {
+            "type-name": "Struct",
+            "name": "MerkleTreePath",
+            "elements": [
+              {
+                "name": "leaf",
+                "type": {
+                  "type-name": "Bytes",
+                  "length": 32
+                }
+              },
+              {
+                "name": "path",
+                "type": {
+                  "type-name": "Vector",
+                  "length": 32,
+                  "type": {
+                    "type-name": "Struct",
+                    "name": "MerkleTreePathEntry",
+                    "elements": [
+                      {
+                        "name": "sibling",
+                        "type": {
+                          "type-name": "Struct",
+                          "name": "MerkleTreeDigest",
+                          "elements": [
+                            {
+                              "name": "field",
+                              "type": {
+                                "type-name": "Field"
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "name": "goes_left",
+                        "type": {
+                          "type-name": "Boolean"
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "coin",
+          "type": {
+            "type-name": "Struct",
+            "name": "CoinInfo",
+            "elements": [
+              {
+                "name": "nonce",
+                "type": {
+                  "type-name": "Bytes",
+                  "length": 32
+                }
+              },
+              {
+                "name": "color",
+                "type": {
+                  "type-name": "Bytes",
+                  "length": 32
+                }
+              },
+              {
+                "name": "value",
+                "type": {
+                  "type-name": "Unsigned",
+                  "maxval": 340282366920938463463374607431768211455
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "rc",
+          "type": {
+            "type-name": "Field"
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Void"
+      }
+    },
+    {
+      "name": "output",
+      "pure": false,
+      "arguments": [
+        {
+          "name": "pk",
+          "type": {
+            "type-name": "Struct",
+            "name": "Either",
+            "elements": [
+              {
+                "name": "is_left",
+                "type": {
+                  "type-name": "Boolean"
+                }
+              },
+              {
+                "name": "left",
+                "type": {
+                  "type-name": "Struct",
+                  "name": "ZswapCoinPublicKey",
+                  "elements": [
+                    {
+                      "name": "bytes",
+                      "type": {
+                        "type-name": "Bytes",
+                        "length": 32
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "right",
+                "type": {
+                  "type-name": "Struct",
+                  "name": "ContractAddress",
+                  "elements": [
+                    {
+                      "name": "bytes",
+                      "type": {
+                        "type-name": "Bytes",
+                        "length": 32
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "coin",
+          "type": {
+            "type-name": "Struct",
+            "name": "CoinInfo",
+            "elements": [
+              {
+                "name": "nonce",
+                "type": {
+                  "type-name": "Bytes",
+                  "length": 32
+                }
+              },
+              {
+                "name": "color",
+                "type": {
+                  "type-name": "Bytes",
+                  "length": 32
+                }
+              },
+              {
+                "name": "value",
+                "type": {
+                  "type-name": "Unsigned",
+                  "maxval": 340282366920938463463374607431768211455
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "rc",
+          "type": {
+            "type-name": "Field"
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Void"
+      }
+    },
+    {
+      "name": "sign",
+      "pure": false,
+      "arguments": [
+        {
+          "name": "secret_key",
+          "type": {
+            "type-name": "Struct",
+            "name": "ZswapCoinSecretKey",
+            "elements": [
+              {
+                "name": "bytes",
+                "type": {
+                  "type-name": "Bytes",
+                  "length": 32
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Void"
+      }
+    }
+  ]
+}

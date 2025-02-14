@@ -1,0 +1,25 @@
+{
+  "include": [
+    "index.ts"
+  ],
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist",
+    "declaration": true,
+    "lib": [
+      "ESNext"
+    ],
+    "target": "ESNext",
+    "module": "NodeNext",
+    "moduleResolution": "nodenext",
+    "allowJs": true,
+    "forceConsistentCasingInFileNames": true,
+    "noImplicitAny": true,
+    "strict": true,
+    "isolatedModules": true,
+    "sourceMap": true,
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  }
+}

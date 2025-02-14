@@ -164,10 +164,7 @@ pub async fn balance_and_submit_tx(
     tracing::trace!(?unbalanced_tx, "unbalanced transaction received");
 
     if let Some(constraints) = whitelisting {
-        tracing::info!("validations");
-
         let is_call_to_known_contract = check_call(db, &unbalanced_tx, network_id)?;
-        // .map_err(|e| Error::InternalError(e.to_string()))?;
 
         if !is_call_to_known_contract {
             let deploy = check_deploy(constraints, &unbalanced_tx, network_id)?;

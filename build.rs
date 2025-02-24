@@ -2,6 +2,7 @@ use toml_edit::{value, DocumentMut};
 
 fn main() {
     let files = [
+        "zkir",
         "base-crypto",
         "coin-structure",
         "ledger",

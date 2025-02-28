@@ -55,6 +55,7 @@ struct GetFundsResponse {
 struct OpenLobby {
     address: String,
     block_height: u64,
+    p1_public_key: String,
 }
 
 #[derive(Serialize)]
@@ -66,6 +67,8 @@ struct PlayerLobby {
     address: String,
     state: String,
     block_height: u64,
+    p1_public_key: String,
+    p2_public_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -199,9 +202,11 @@ async fn get_open_lobbies(
         Ok(lobbies) => Ok(Json(GetOpenLobbiesResponse(
             lobbies
                 .into_iter()
-                .map(|(address, block_height)| OpenLobby {
-                    address,
+                .map(|(address, block_height, p1_public_key)| OpenLobby {
+                    // for some reason the game expects the address without the network prefix
+                    address: address[2..].to_string(),
                     block_height,
+                    p1_public_key,
                 })
                 .collect::<Vec<_>>(),
         ))),
@@ -232,11 +237,20 @@ async fn get_player_lobbies(
         Ok(lobbies) => Ok(Json(GetPlayerLobbiesResponse(
             lobbies
                 .into_iter()
-                .map(|(address, state, block_height)| PlayerLobby {
-                    address,
-                    state,
-                    block_height,
-                })
+                .map(
+                    |(address, state, block_height, p1_public_key, p2_public_key)| PlayerLobby {
+                        // for some reason the game expects the address without the network prefix
+                        address: address[2..].to_string(),
+                        state,
+                        block_height,
+                        p1_public_key,
+                        p2_public_key: p2_public_key
+                            .split(";")
+                            .nth(1)
+                            .map(|s| s.to_string())
+                            .filter(|s| !s.is_empty()),
+                    },
+                )
                 .collect::<Vec<_>>(),
         ))),
         Err(error) => Err(Error::InternalError(error.to_string())),

@@ -1,18 +1,14 @@
 use anyhow::Context as _;
-use deadpool_sqlite::{Config, Manager, Pool, Runtime};
+use deadpool_sqlite::{Config, Pool, Runtime};
 use midnight_zswap::{
     local::State,
     serialize::{deserialize, serialize, NetworkId},
 };
-use rusqlite::{Connection, OptionalExtension as _};
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use rusqlite::OptionalExtension as _;
+use std::path::Path;
 
 #[derive(Clone)]
 pub struct Db {
-    // conn: Arc<Mutex<Connection>>,
     pool: Pool,
     network_id: NetworkId,
 }
@@ -150,13 +146,13 @@ impl Db {
         &self,
         after: Option<String>,
         count: Option<u8>,
-    ) -> anyhow::Result<Vec<(String, u64)>> {
+    ) -> anyhow::Result<Vec<(String, u64, String)>> {
         let conn = self.pool.get().await.unwrap();
 
         conn.interact(move |conn| {
             let mut stmt = conn.prepare(
                 "
-                SELECT id, block_number FROM contract_address
+                SELECT id, block_number, p1_public_key FROM contract_address
                 WHERE p2_public_key = '00;' AND
                     (?1 IS NULL OR rowid < (SELECT max(rowid) FROM contract_address WHERE id = ?1))
                 ORDER BY rowid DESC
@@ -165,7 +161,7 @@ impl Db {
 
             let rows = stmt
                 .query_map((after, count.unwrap_or(10).to_string()), |row| {
-                    Ok((row.get(0)?, row.get(1)?))
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })
                 .context("Database error")?;
 
@@ -185,14 +181,14 @@ impl Db {
         public_key: String,
         limit: Option<u8>,
         after: Option<String>,
-    ) -> anyhow::Result<Vec<(String, String, u64)>> {
+    ) -> anyhow::Result<Vec<(String, String, u64, String, String)>> {
         let conn = self.pool.get().await.unwrap();
 
         let public_key = public_key.to_string();
 
         conn.interact(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, game_state, block_number FROM contract_address
+                "SELECT id, game_state, block_number, p1_public_key, p2_public_key FROM contract_address
                 WHERE
                     (p1_public_key = ?1 OR p2_public_key = ?1) AND
                     (?3 IS NULL OR (rowid < (SELECT max(rowid) FROM contract_address WHERE id = ?3)))
@@ -201,8 +197,8 @@ impl Db {
             )?;
 
             let rows = stmt
-                .query_map([public_key, limit.unwrap_or(10).to_string(), dbg!(after.unwrap_or_default())], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                .query_map((public_key, limit.unwrap_or(10), after), |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
                 })
                 .context("Database error")?;
 

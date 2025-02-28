@@ -45,22 +45,26 @@ pub fn read_constraints(
     Ok(Arc::new(res))
 }
 
-pub fn check_call(db: &Db, tx: &Transaction<Proof>, network_id: NetworkId) -> anyhow::Result<bool> {
+pub async fn check_call(
+    db: &Db,
+    tx: &Transaction<Proof>,
+    network_id: NetworkId,
+) -> anyhow::Result<Option<String>> {
     let tx = match tx {
         Transaction::Standard(standard_transaction) => standard_transaction,
-        Transaction::ClaimMint(_) => return Ok(false),
+        Transaction::ClaimMint(_) => return Ok(None),
     };
 
     let Some(contract_calls) = &tx.contract_calls else {
-        return Ok(false);
+        return Ok(None);
     };
 
     if contract_calls.calls.len() > 1 {
-        return Ok(false);
+        return Ok(None);
     }
 
     let ContractAction::Call(call) = &contract_calls.calls[0] else {
-        return Ok(false);
+        return Ok(None);
     };
 
     let mut buf = vec![];
@@ -69,7 +73,11 @@ pub fn check_call(db: &Db, tx: &Transaction<Proof>, network_id: NetworkId) -> an
 
     let hex_address = hex::encode(buf);
 
-    db.check_address(hex_address)
+    if db.check_address(&hex_address).await? {
+        Ok(Some(hex_address))
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn check_deploy(

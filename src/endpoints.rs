@@ -6,7 +6,15 @@ use crate::{
 };
 use midnight_zswap::serialize::{self, NetworkId};
 use rand::{rngs::OsRng, Rng};
-use rocket::{http::Method, serde::json::Json, State};
+use rocket::{
+    figment::{
+        providers::{Env, Format as _, Toml},
+        Figment,
+    },
+    http::Method,
+    serde::json::Json,
+    State,
+};
 use rocket_cors::{AllowedOrigins, CorsOptions};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -42,6 +50,27 @@ struct GetFundsResponse {
     coins: Vec<(String, String)>,
     pending: Vec<String>,
 }
+
+#[derive(Serialize)]
+struct OpenLobby {
+    address: String,
+    block_height: u64,
+}
+
+#[derive(Serialize)]
+#[serde(transparent)]
+struct GetOpenLobbiesResponse(Vec<OpenLobby>);
+
+#[derive(Serialize)]
+struct PlayerLobby {
+    address: String,
+    state: String,
+    block_height: u64,
+}
+
+#[derive(Serialize)]
+#[serde(transparent)]
+struct GetPlayerLobbiesResponse(Vec<PlayerLobby>);
 
 #[derive(Responder)]
 pub enum Error {
@@ -148,6 +177,72 @@ async fn address(state: &State<AppState>) -> String {
     state.address.clone()
 }
 
+#[get("/lobbies/open?<after>&<count>")]
+async fn get_open_lobbies(
+    state: &State<AppState>,
+    after: Option<String>,
+    count: Option<u8>,
+) -> Result<Json<GetOpenLobbiesResponse>, Error> {
+    let sync_status = state.sync_status.lock().await;
+
+    match *sync_status {
+        SyncStatus::Syncing {
+            progress: _,
+            notify: _,
+        } => return Err(Error::NotAvailable("Wallet not in sync".to_string())),
+        SyncStatus::UpToDate => {}
+    };
+
+    let lobbies = state.db.get_lobbies_waiting_for_p2(after, count).await;
+
+    match lobbies {
+        Ok(lobbies) => Ok(Json(GetOpenLobbiesResponse(
+            lobbies
+                .into_iter()
+                .map(|(address, block_height)| OpenLobby {
+                    address,
+                    block_height,
+                })
+                .collect::<Vec<_>>(),
+        ))),
+        Err(error) => Err(Error::InternalError(error.to_string())),
+    }
+}
+
+#[get("/lobbies/player/<player_id>?<after>&<count>")]
+async fn get_player_lobbies(
+    state: &State<AppState>,
+    player_id: String,
+    after: Option<String>,
+    count: Option<u8>,
+) -> Result<Json<GetPlayerLobbiesResponse>, Error> {
+    let sync_status = state.sync_status.lock().await;
+
+    match *sync_status {
+        SyncStatus::Syncing {
+            progress: _,
+            notify: _,
+        } => return Err(Error::NotAvailable("Wallet not in sync".to_string())),
+        SyncStatus::UpToDate => {}
+    };
+
+    let lobbies = state.db.get_player_lobbies(player_id, count, after).await;
+
+    match lobbies {
+        Ok(lobbies) => Ok(Json(GetPlayerLobbiesResponse(
+            lobbies
+                .into_iter()
+                .map(|(address, state, block_height)| PlayerLobby {
+                    address,
+                    state,
+                    block_height,
+                })
+                .collect::<Vec<_>>(),
+        ))),
+        Err(error) => Err(Error::InternalError(error.to_string())),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn rocket(
     prover_params: Arc<ProvingParams>,
@@ -182,8 +277,21 @@ pub fn rocket(
         )
         .allow_credentials(true);
 
-    rocket::build()
+    let figment = Figment::from(rocket::Config::default())
+        .merge(Toml::file("batcher-config.toml").nested())
+        .merge(Env::prefixed("PAIMA_MIDNIGHT_BATCHER_").global());
+
+    rocket::custom(figment)
         .manage(state)
-        .mount("/", routes![submit_tx, funds, address])
+        .mount(
+            "/",
+            routes![
+                submit_tx,
+                funds,
+                address,
+                get_open_lobbies,
+                get_player_lobbies
+            ],
+        )
         .attach(cors.to_cors().unwrap())
 }

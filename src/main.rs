@@ -12,8 +12,11 @@ use balancing::ProvingParams;
 use clap::{arg, Command};
 use db::Db;
 use futures::{SinkExt, StreamExt};
+use midnight_ledger::onchain_runtime::state::{ContractState, StateValue};
+use midnight_ledger::onchain_runtime::state_value_ext::StateValueExt;
 use midnight_ledger::structure::Transaction;
 use midnight_transient_crypto::proofs::Proof;
+use midnight_zswap::base_crypto::fab::{AlignedValue, AlignmentAtom, AlignmentSegment};
 use midnight_zswap::local::State;
 use midnight_zswap::serialize::{deserialize, serialize, NetworkId};
 use preproofing::pre_proving_service;
@@ -115,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
 
     let proving_params = Arc::new(ProvingParams::new()?);
 
-    let db = Db::open_db(db, network_id)?;
+    let db = Db::open_db(db, network_id).await?;
 
     let seed = std::fs::read_to_string(credentials).context("Failed to read credentials")?;
 
@@ -124,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|_| anyhow::anyhow!("expected seed to contain 32 bytes"))?,
     );
 
-    let maybe_latest_state = db.get_state(STABLE_STATE_ID)?;
+    let maybe_latest_state = db.get_state(STABLE_STATE_ID).await?;
 
     let initial_state = maybe_latest_state
         .as_ref()
@@ -308,11 +311,17 @@ async fn wallet_indexer(
                     }
 
                     #[derive(Debug, Deserialize)]
+                    pub struct TransactionBlock {
+                        pub height: u64,
+                    }
+
+                    #[derive(Debug, Deserialize)]
                     pub struct TransactionAdded {
                         pub hash: String,
                         #[serde(rename = "applyStage")]
                         pub apply_stage: String,
                         pub raw: String,
+                        pub block: TransactionBlock,
                     }
 
                     #[derive(Debug, Deserialize)]
@@ -379,6 +388,7 @@ async fn wallet_indexer(
                 }
 
                 let raw_tx = transaction.raw;
+                let block_number = transaction.block.height;
 
                 let tx: Transaction<Proof> = deserialize::<Transaction<Proof>, _>(
                     std::io::Cursor::new(hex::decode(raw_tx).unwrap()),
@@ -394,10 +404,114 @@ async fn wallet_indexer(
                 if let Some(constraints) = constraints.as_ref() {
                     let deploy_address = whitelisting::check_deploy(constraints, &tx, network_id)?;
 
-                    if let Some(deploy_address) = deploy_address {
-                        db.insert_contract_address(&deploy_address)?;
+                    if let Some(deploy_address) = &deploy_address {
+                        db.insert_contract_address(deploy_address).await?;
 
                         tracing::info!("detected new contract address: {}", deploy_address);
+                    }
+
+                    let contract_call_address =
+                        whitelisting::check_call(&db, &tx, network_id).await?;
+
+                    if let Some(contract_address) = deploy_address.or(contract_call_address) {
+                        let url = "http://127.0.0.1:8088/api/v1/graphql";
+                        let tx_hash = tx.transaction_hash();
+
+                        tracing::info!("querying contract state");
+                        let res: serde_json::Value = reqwest::Client::new()
+                            .post(dbg!(url))
+                            .json(&json!({
+                                "query": format!(r#"{{
+                            contract(address: "{}", transactionOffset: {{ hash: "{}" }} ) {{
+                                state
+                            }}
+                        }}"#, contract_address, hex::encode(tx_hash.0.0)),
+                            }))
+                            .send()
+                            .await?
+                            .json()
+                            .await?;
+
+                        let state_raw =
+                            hex::decode(res["data"]["contract"]["state"].as_str().unwrap())
+                                .unwrap();
+
+                        let state: ContractState =
+                            deserialize(std::io::Cursor::new(state_raw), network_id)?;
+
+                        let mut flattened_entries = vec![];
+                        match &state.data {
+                            StateValue::Array(arr) => {
+                                for entry in arr.iter() {
+                                    match &*entry {
+                                        StateValue::Array(arr) => {
+                                            for entry in arr.iter() {
+                                                flattened_entries.push(entry.as_cell().unwrap())
+                                            }
+                                        }
+                                        StateValue::Cell(cell) => {
+                                            flattened_entries.push(Arc::clone(cell));
+                                        }
+                                        _ => todo!(),
+                                    }
+                                }
+                            }
+                            _ => todo!(),
+                        }
+
+                        let mapped_entries = flattened_entries
+                            .clone()
+                            .into_iter()
+                            .rev()
+                            .take(3)
+                            .rev()
+                            .map(|state_var| {
+                                let mut joined = state_var
+                                    .value
+                                    .0
+                                    .iter()
+                                    .zip(state_var.alignment.0.iter())
+                                    .map(|(value, alignment)| match &alignment {
+                                        AlignmentSegment::Atom(atom) => match &atom {
+                                            AlignmentAtom::Compress => "".to_string(),
+                                            AlignmentAtom::Bytes { length } => {
+                                                let mut s = hex::encode(&value.0);
+
+                                                if let Some(missing_zeroes) =
+                                                    (*length as usize).checked_sub(value.0.len())
+                                                {
+                                                    s.extend(
+                                                        std::iter::repeat('0')
+                                                            .take(missing_zeroes * 2),
+                                                    );
+                                                }
+
+                                                s
+                                            }
+                                            AlignmentAtom::Field => hex::encode(&value.0),
+                                        },
+                                        _ => todo!(),
+                                    })
+                                    .fold(String::new(), |mut s, v| {
+                                        s.push_str(&v);
+                                        s.push(';');
+                                        s
+                                    });
+
+                                joined.pop();
+
+                                joined
+                            })
+                            .collect::<Vec<_>>();
+
+                        db.update_contract_state(
+                            &contract_address,
+                            &mapped_entries[0],
+                            &mapped_entries[1],
+                            &mapped_entries[2],
+                            block_number,
+                        )
+                        .await?;
                     }
                 }
 
@@ -425,7 +539,8 @@ async fn wallet_indexer(
 
                 signal.notify_waiters();
 
-                db.persist_state(STABLE_STATE_ID, &tx_hash, &confirmed_state)?;
+                db.persist_state(STABLE_STATE_ID, &tx_hash, &confirmed_state)
+                    .await?;
 
                 // dbg!(&confirmed_state.coins);
                 // dbg!(&confirmed_state.merkle_tree);

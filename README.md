@@ -17,12 +17,9 @@ duplicated git dependencies.
 cd ./local-chain-setup
 source .envrc
 npm install
-npm run start
+npm run fund-batcher
+docker compose up
 ```
-
-The first time the script runs, it will setup the new chain, and send funds to the batcher.
-
-The next time it just runs `docker compose up`.
 
 2. Run the batcher.
 

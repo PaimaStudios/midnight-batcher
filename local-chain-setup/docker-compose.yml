@@ -1,4 +1,15 @@
 services:
+  proof-server:
+    container_name: 'midnight-local-proof-server-080'
+    image: 'midnightnetwork/proof-server:3.0.6'
+    logging:
+        # driver: none
+        driver: local
+    ports:
+      - "6300:6300"
+    environment:
+      # RUST_BACKTRACE: "full"
+      RUST_LOG: "error"
   indexer:
     container_name: 'midnight-local-indexer-080'
     image: 'midnightnetwork/midnight-pubsub-indexer:2.3.0'

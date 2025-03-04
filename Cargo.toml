@@ -28,6 +28,7 @@ midnight-ledger = { path = "./midnight-ledger-prototype/ledger", features = ["tr
 midnight-transient-crypto = { path = "./midnight-ledger-prototype/transient-crypto", package = "midnight-transient-crypto" }
 sha256 = "1.5.0"
 deadpool-sqlite = "0.10.0"
+rayon = "1.10.0"
 
 # midnight-base-crypto = { git = "https://github.com/input-output-hk/midnight-ledger-prototype", rev = "base-crypto-0.4" }
 

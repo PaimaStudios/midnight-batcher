@@ -2,7 +2,7 @@ use crate::{
     db::Db,
     endpoints::Error,
     midnight::{self},
-    preproofing::PreProvingServiceChannelTx,
+    preproofing::{prove_tx_in_rayon_pool, PreProvingServiceChannelTx},
     whitelisting::{self, check_call, check_deploy},
 };
 use anyhow::Context as _;
@@ -140,7 +140,7 @@ impl ProvingParams {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn balance_and_submit_tx(
-    prover_params: &ProvingParams,
+    prover_params: Arc<ProvingParams>,
     api: &OnlineClient<SubstrateConfig>,
     base_state: Arc<Mutex<State>>,
     tx: &str,
@@ -258,7 +258,7 @@ pub async fn balance_and_submit_tx(
         inputs_tx.clone(),
         curr_balance,
         fees,
-        prover_params,
+        Arc::clone(&prover_params),
         PublicKeys {
             coin_public_key,
             enc_public_key,
@@ -293,7 +293,7 @@ async fn prove_and_submit(
     inputs_tx: Transaction<Proof>,
     curr_balance: u128,
     fees: u128,
-    prover_params: &ProvingParams,
+    prover_params: Arc<ProvingParams>,
     public_keys: PublicKeys,
     unbalanced_tx: Transaction<Proof>,
     network_id: NetworkId,
@@ -322,15 +322,7 @@ async fn prove_and_submit(
 
     let instant = std::time::Instant::now();
 
-    let outputs_tx = outputs_tx
-        .prove(OsRng, &prover_params.pp, |loc| match &*loc.0 {
-            "midnight/zswap/spend" => Some(prover_params.spend.clone()),
-            "midnight/zswap/output" => Some(prover_params.output.clone()),
-            "midnight/zswap/sign" => Some(prover_params.sign.clone()),
-            _ => unreachable!("this transaction does not have contract calls"),
-        })
-        .await
-        .map_err(|e| Error::BadRequest(format!("Invalid transaction {}", e)))?;
+    let outputs_tx = prove_tx_in_rayon_pool(&prover_params, outputs_tx).await;
 
     tracing::info!(
         "proved outputs zswap in {} ms",

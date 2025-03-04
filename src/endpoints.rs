@@ -113,7 +113,7 @@ async fn submit_tx(
     let now = std::time::Instant::now();
 
     let (tx_hash, identifiers) = balance_and_submit_tx(
-        &state.proving_params,
+        Arc::clone(&state.proving_params),
         &state.api,
         Arc::clone(&state.zswap_state),
         &transaction.tx,

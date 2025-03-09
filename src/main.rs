@@ -183,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
                     unreachable!("indexer task returned without error");
                 };
 
-                tracing::error!(reason=%error, "sync task stopped");
+                tracing::error!(reason=%error, "sync task stopped, restarting in: {} seconds", sleep_time.as_secs());
 
                 tokio::time::sleep(sleep_time).await;
             }
@@ -244,7 +244,7 @@ async fn wallet_indexer(
 
     let (ws_stream, _) = connect_async(req).await.expect("Failed to connect");
 
-    println!("WebSocket connection established!");
+    tracing::info!("WebSocket connection to the midnight indexer established");
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -552,8 +552,15 @@ async fn wallet_indexer(
             }
             Ok(_) => {}
             Err(e) => {
-                eprintln!("Error: {}", e);
-                panic!("{}", e);
+                tracing::error!("graphql suscription error: {}", e);
+
+                *sync_status.lock().await = SyncStatus::Syncing {
+                    // technically not correct, but this is not used for anything useful anyway.
+                    progress: 0.0,
+                    notify: None,
+                };
+
+                anyhow::bail!("graphql subscription error: {}", e);
             }
         }
     }

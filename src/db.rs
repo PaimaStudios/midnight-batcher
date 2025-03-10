@@ -146,6 +146,7 @@ impl Db {
         &self,
         after: Option<String>,
         count: Option<u8>,
+        exclude_player: Option<String>,
     ) -> anyhow::Result<Vec<(String, u64, String)>> {
         let conn = self.pool.get().await.unwrap();
 
@@ -154,13 +155,14 @@ impl Db {
                 "
                 SELECT id, block_number, p1_public_key FROM contract_address
                 WHERE p2_public_key = '00;' AND
-                    (?1 IS NULL OR rowid < (SELECT max(rowid) FROM contract_address WHERE id = ?1))
+                    (?1 IS NULL OR rowid < (SELECT max(rowid) FROM contract_address WHERE id = ?1)) AND
+                    (?3 IS NULL OR p1_public_key <> ?3)
                 ORDER BY rowid DESC
                 LIMIT ?2",
             )?;
 
             let rows = stmt
-                .query_map((after, count.unwrap_or(10).to_string()), |row| {
+                .query_map((after, count.unwrap_or(10).to_string(), exclude_player), |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })
                 .context("Database error")?;

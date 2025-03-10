@@ -178,15 +178,19 @@ async fn address(state: &State<AppState>) -> String {
     state.address.clone()
 }
 
-#[get("/lobbies/open?<after>&<count>")]
+#[get("/lobbies/open?<after>&<count>&<exclude_player>")]
 async fn get_open_lobbies(
     state: &State<AppState>,
     after: Option<String>,
     count: Option<u8>,
+    exclude_player: Option<String>,
 ) -> Result<Json<GetOpenLobbiesResponse>, Error> {
     check_is_wallet_in_sync(state).await?;
 
-    let lobbies = state.db.get_lobbies_waiting_for_p2(after, count).await;
+    let lobbies = state
+        .db
+        .get_lobbies_waiting_for_p2(after, count, exclude_player)
+        .await;
 
     match lobbies {
         Ok(lobbies) => Ok(Json(GetOpenLobbiesResponse(

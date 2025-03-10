@@ -2598,6 +2598,7 @@ dependencies = [
  "midnight-zswap",
  "rand",
  "rand_chacha",
+ "rayon",
  "reqwest",
  "rocket",
  "rocket_cors",

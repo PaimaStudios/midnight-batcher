@@ -19,14 +19,14 @@ use rocket_cors::{AllowedOrigins, CorsOptions};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use subxt::{OnlineClient, SubstrateConfig};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::Instrument as _;
 
 struct AppState {
     proving_params: Arc<ProvingParams>,
     zswap_state: Arc<Mutex<midnight_zswap::local::State>>,
     network_id: NetworkId,
-    sync_status: Arc<Mutex<SyncStatus>>,
+    sync_status: Arc<RwLock<SyncStatus>>,
     api: OnlineClient<SubstrateConfig>,
     inputs_service: PreProvingServiceChannelTx,
     whitelisting: Arc<Option<whitelisting::Constraints>>,
@@ -92,15 +92,8 @@ impl From<anyhow::Error> for Error {
     }
 }
 
-#[post("/submitTx", format = "json", data = "<transaction>")]
-async fn submit_tx(
-    transaction: Json<Transaction>,
-    state: &State<AppState>,
-) -> Result<Json<SubmitTxResponse>, Error> {
-    let span_id: u128 = OsRng.gen();
-    let span = tracing::info_span!("submit_tx handler", span_id);
-
-    let sync_status = state.sync_status.lock().await;
+async fn check_is_wallet_in_sync(state: &AppState) -> Result<(), Error> {
+    let sync_status = state.sync_status.read().await;
 
     match *sync_status {
         SyncStatus::Syncing {
@@ -109,6 +102,19 @@ async fn submit_tx(
         } => return Err(Error::NotAvailable("Wallet not in sync".to_string())),
         SyncStatus::UpToDate => {}
     }
+
+    Ok(())
+}
+
+#[post("/submitTx", format = "json", data = "<transaction>")]
+async fn submit_tx(
+    transaction: Json<Transaction>,
+    state: &State<AppState>,
+) -> Result<Json<SubmitTxResponse>, Error> {
+    let span_id: u128 = OsRng.gen();
+    let span = tracing::info_span!("submit_tx handler", span_id);
+
+    check_is_wallet_in_sync(state).await?;
 
     let now = std::time::Instant::now();
 
@@ -140,15 +146,7 @@ async fn submit_tx(
 
 #[get("/funds")]
 async fn funds(state: &State<AppState>) -> Result<Json<GetFundsResponse>, Error> {
-    let sync_status = state.sync_status.lock().await;
-
-    match *sync_status {
-        SyncStatus::Syncing {
-            progress: _,
-            notify: _,
-        } => return Err(Error::NotAvailable("Wallet not in sync".to_string())),
-        SyncStatus::UpToDate => {}
-    };
+    check_is_wallet_in_sync(state).await?;
 
     let lock = state.zswap_state.lock().await;
 
@@ -186,15 +184,7 @@ async fn get_open_lobbies(
     after: Option<String>,
     count: Option<u8>,
 ) -> Result<Json<GetOpenLobbiesResponse>, Error> {
-    let sync_status = state.sync_status.lock().await;
-
-    match *sync_status {
-        SyncStatus::Syncing {
-            progress: _,
-            notify: _,
-        } => return Err(Error::NotAvailable("Wallet not in sync".to_string())),
-        SyncStatus::UpToDate => {}
-    };
+    check_is_wallet_in_sync(state).await?;
 
     let lobbies = state.db.get_lobbies_waiting_for_p2(after, count).await;
 
@@ -221,15 +211,7 @@ async fn get_player_lobbies(
     after: Option<String>,
     count: Option<u8>,
 ) -> Result<Json<GetPlayerLobbiesResponse>, Error> {
-    let sync_status = state.sync_status.lock().await;
-
-    match *sync_status {
-        SyncStatus::Syncing {
-            progress: _,
-            notify: _,
-        } => return Err(Error::NotAvailable("Wallet not in sync".to_string())),
-        SyncStatus::UpToDate => {}
-    };
+    check_is_wallet_in_sync(state).await?;
 
     let lobbies = state.db.get_player_lobbies(player_id, count, after).await;
 
@@ -263,7 +245,7 @@ pub fn rocket(
     api: OnlineClient<SubstrateConfig>,
     zswap_state: Arc<Mutex<midnight_zswap::local::State>>,
     network_id: NetworkId,
-    sync_status: Arc<Mutex<SyncStatus>>,
+    sync_status: Arc<RwLock<SyncStatus>>,
     inputs_service: PreProvingServiceChannelTx,
     whitelisting: Option<whitelisting::Constraints>,
     db: Db,

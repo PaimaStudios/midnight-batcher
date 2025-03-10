@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
     task::{Context, Waker},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info_span, Instrument as _};
 
 #[derive(Clone)]
@@ -40,7 +40,7 @@ pub async fn pre_proving_service(
     prover_params: Arc<ProvingParams>,
     signal: Arc<tokio::sync::Notify>,
     mut comm: PreProvingServiceChannelRx,
-    sync_status: Arc<Mutex<SyncStatus>>,
+    sync_status: Arc<RwLock<SyncStatus>>,
 ) {
     let proven: Arc<Mutex<HashMap<Nullifier, ProofOrNotifier>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -85,7 +85,7 @@ pub async fn pre_proving_service(
     }
 
     loop {
-        let mut sync_status_guard = sync_status.lock().await;
+        let mut sync_status_guard = sync_status.write().await;
         if let SyncStatus::Syncing {
             progress: _,
             notify,

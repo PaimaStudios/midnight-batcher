@@ -26,7 +26,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use subxt::{OnlineClient, SubstrateConfig};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{self, client::IntoClientRequest, http::HeaderValue},
@@ -145,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
 
     let current_tx = maybe_latest_state.map(|(hash, _)| hash);
 
-    let sync_status = Arc::new(Mutex::new(SyncStatus::Syncing {
+    let sync_status = Arc::new(RwLock::new(SyncStatus::Syncing {
         progress: 0.0,
         notify: None,
     }));
@@ -226,7 +226,7 @@ async fn wallet_indexer(
     latest_state: Arc<Mutex<State>>,
     current_tx: Option<String>,
     network_id: NetworkId,
-    sync_status: Arc<Mutex<SyncStatus>>,
+    sync_status: Arc<RwLock<SyncStatus>>,
     signal: Arc<tokio::sync::Notify>,
     constraints: Option<whitelisting::Constraints>,
 ) -> anyhow::Result<()> {
@@ -362,7 +362,7 @@ async fn wallet_indexer(
                 let transaction = match val.payload.data.transactions {
                     gql::TransactionOrUpdate::TransactionAdded(tx_added) => tx_added.transaction,
                     gql::TransactionOrUpdate::ProgressUpdate(pu) => {
-                        let mut sync_status = sync_status.lock().await;
+                        let mut sync_status = sync_status.write().await;
                         if (pu.synced / pu.total) > 0.95 {
                             if let SyncStatus::Syncing {
                                 progress: _,
@@ -558,7 +558,7 @@ async fn wallet_indexer(
             Err(e) => {
                 tracing::error!("graphql suscription error: {}", e);
 
-                *sync_status.lock().await = SyncStatus::Syncing {
+                *sync_status.write().await = SyncStatus::Syncing {
                     // technically not correct, but this is not used for anything useful anyway.
                     progress: 0.0,
                     notify: None,

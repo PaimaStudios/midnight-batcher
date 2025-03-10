@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use tracing::{info_span, Instrument as _};
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum ProofOrNotifier {
     Waiting(Arc<tokio::sync::Notify>),
     Ready(Transaction<Proof>),

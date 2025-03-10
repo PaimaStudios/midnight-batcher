@@ -258,15 +258,19 @@ async fn wallet_indexer(
     write
         .send(tungstenite::Message::Text(init_query.to_string()))
         .await
-        .expect("Failed to send init message");
+        .context("failed to initialize graphql subscription")?;
 
-    let _message = read.next().await.unwrap().unwrap();
+    let _message = read
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected a message"))?
+        .context("graphql subscription error")?;
 
-    // if let tungstenite::Message::Text(text) = message {
-    //     println!("Received?: {}", text);
-    // }
-
-    let _message = read.next().await.unwrap().unwrap();
+    let _message = read
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected a message"))?
+        .context("graphql subscription error")?;
 
     let subscription_query = |start: Option<String>| {
         if let Some(start) = start {
@@ -297,7 +301,7 @@ async fn wallet_indexer(
     write
         .send(tungstenite::Message::Text(subscription_query.to_string()))
         .await
-        .expect("Failed to send message");
+        .context("Failed to send subscription query initiation message")?;
 
     while let Some(message) = read.next().await {
         match message {

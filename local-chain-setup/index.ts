@@ -20,8 +20,6 @@ const execP = promisify(exec);
 // const COMPOSE_PROJECT_NAME = process.env.COMPOSE_PROJECT_NAME;
 
 // const volumeExists = stdout.split("\n").map(s => s.split(" ").filter(s => s.length)).some(s => s[1] === `${COMPOSE_PROJECT_NAME}_midnight-data-undeployed`);
-console.log("volume not found, starting setup of new network");
-
 
 const GENESIS_MINT_WALLET_SEED =
   "0000000000000000000000000000000000000000000000000000000000000001";

@@ -17,8 +17,9 @@ duplicated git dependencies.
 cd ./local-chain-setup
 source .envrc
 npm install
-npm run fund-batcher
 docker compose up
+# in another terminal
+npm run fund-batcher
 ```
 
 2. Run the batcher.

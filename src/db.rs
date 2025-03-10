@@ -190,7 +190,7 @@ impl Db {
             let mut stmt = conn.prepare(
                 "SELECT id, game_state, block_number, p1_public_key, p2_public_key FROM contract_address
                 WHERE
-                    (p1_public_key = ?1 OR p2_public_key = ?1) AND
+                    (p1_public_key = ?1 OR p2_public_key = ('01;' || ?1) ) AND
                     (?3 IS NULL OR (rowid < (SELECT max(rowid) FROM contract_address WHERE id = ?3)))
                 ORDER BY rowid DESC
                 LIMIT ?2",

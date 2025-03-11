@@ -97,9 +97,14 @@ async fn check_is_wallet_in_sync(state: &AppState) -> Result<(), Error> {
 
     match *sync_status {
         SyncStatus::Syncing {
-            progress: _,
+            progress,
             notify: _,
-        } => return Err(Error::NotAvailable("Wallet not in sync".to_string())),
+        } => {
+            return Err(Error::NotAvailable(format!(
+                "Wallet not in sync. Current progress: {}",
+                progress
+            )))
+        }
         SyncStatus::UpToDate => {}
     }
 

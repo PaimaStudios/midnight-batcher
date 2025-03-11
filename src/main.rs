@@ -18,7 +18,7 @@ use midnight_ledger::structure::Transaction;
 use midnight_transient_crypto::proofs::Proof;
 use midnight_zswap::base_crypto::fab::{AlignmentAtom, AlignmentSegment};
 use midnight_zswap::local::State;
-use midnight_zswap::serialize::{deserialize, serialize, NetworkId};
+use midnight_zswap::serialize::{deserialize, NetworkId, Serializable};
 use preproofing::pre_proving_service;
 use rand::SeedableRng as _;
 use rand_chacha::ChaCha20Rng;
@@ -49,14 +49,16 @@ pub enum SyncStatus {
     UpToDate,
 }
 
-fn address(zswap_state: &State, network_id: NetworkId) -> String {
+fn address(zswap_state: &State) -> String {
     let pk = zswap_state.coin_public_key();
     let epk = zswap_state.enc_public_key();
 
     let pk_hex = hex::encode(pk.0 .0);
     let mut buf = vec![];
-    serialize(&epk, &mut buf, network_id).unwrap();
-    let ec_hex = hex::encode(&buf[1..]);
+
+    <_ as Serializable>::serialize(&epk, &mut buf).unwrap();
+
+    let ec_hex = hex::encode(&buf);
 
     format!("{}|{}", pk_hex, ec_hex)
 }
@@ -139,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|(_, state)| state.clone())
         .unwrap_or_else(|| State::new(&mut rng));
 
-    let address = address(&initial_state, network_id);
+    let address = address(&initial_state);
 
     info!("Batcher address {}", address);
 

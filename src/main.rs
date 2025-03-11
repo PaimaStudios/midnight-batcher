@@ -242,7 +242,9 @@ async fn wallet_indexer(
         HeaderValue::from_static("graphql-ws"),
     );
 
-    let (ws_stream, _) = connect_async(req).await.expect("Failed to connect");
+    let (ws_stream, _) = connect_async(req)
+        .await
+        .context("Couldn't start websocket connection to the Midnight indexer")?;
 
     tracing::info!("WebSocket connection to the midnight indexer established");
 
@@ -357,7 +359,16 @@ async fn wallet_indexer(
                     }
                 }
 
-                let val: gql::Val = serde_json::from_str(&text).unwrap();
+                let val: gql::Val = match serde_json::from_str(&text) {
+                    Ok(val) => val,
+                    Err(error) => {
+                        tracing::error!("raw text: {}", text);
+                        anyhow::bail!(
+                            "json deserialization error of graphql response. {:?}",
+                            error
+                        );
+                    }
+                };
 
                 let transaction = match val.payload.data.transactions {
                     gql::TransactionOrUpdate::TransactionAdded(tx_added) => tx_added.transaction,

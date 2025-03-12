@@ -239,6 +239,15 @@ impl Db {
                 (),
             )?;
 
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_p1_public_key ON contract_address (p1_public_key)",
+                (),
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_p2_public_key ON contract_address (p2_public_key)",
+                (),
+            )?;
+
             Ok(())
         })
         .await

@@ -3,6 +3,7 @@ use crate::{
     endpoints::Error,
     midnight::{self},
     preproofing::{prove_tx_in_rayon_pool, PreProvingServiceChannelTx},
+    utils::OnDrop,
     whitelisting::{self, check_call, check_deploy},
 };
 use anyhow::Context as _;
@@ -236,6 +237,22 @@ pub async fn balance_and_submit_tx(
 
     std::mem::drop(state_guard);
 
+    let mut on_drop_remove_inputs_from_pending = {
+        let inputs = inputs.clone();
+        OnDrop::new(move || {
+            tokio::task::spawn(async move {
+                let offer = Offer {
+                    inputs,
+                    outputs: vec![],
+                    transient: vec![],
+                    deltas: vec![],
+                };
+                let mut state = base_state.lock().await;
+                *state = state.apply_failed(&offer);
+            });
+        })
+    };
+
     let (inputs_tx, inputs_rx) = tokio::sync::oneshot::channel();
     inputs_service
         .send((
@@ -267,20 +284,11 @@ pub async fn balance_and_submit_tx(
         network_id,
         api,
     )
-    .await;
+    .await?;
 
-    if tx_ids.is_err() {
-        match inputs_tx {
-            Transaction::Standard(standard_transaction) => {
-                let inputs_offer = standard_transaction.guaranteed_coins;
+    on_drop_remove_inputs_from_pending.cancel();
 
-                base_state.lock().await.apply_failed(&inputs_offer);
-            }
-            Transaction::ClaimMint(_) => (),
-        }
-    }
-
-    tx_ids
+    Ok(tx_ids)
 }
 
 struct PublicKeys {
@@ -389,22 +397,14 @@ async fn prove_and_submit(
 
     tracing::info!(
         tx_hash,
-        "transaction submitted took {} ms",
+        "transaction submitted and finalized, took {} ms",
         now.elapsed().as_millis()
     );
-
-    let now = std::time::Instant::now();
 
     let _result = in_tx_block
         .wait_for_success()
         .await
         .map_err(|e| Error::InternalError(e.to_string()))?;
-
-    tracing::info!(
-        tx_hash,
-        "transaction submitted, confirmation took {} ms",
-        now.elapsed().as_millis()
-    );
 
     Ok((tx_hash, identifiers))
 }

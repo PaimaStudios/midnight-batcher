@@ -5,6 +5,7 @@ mod balancing;
 mod db;
 mod endpoints;
 mod preproofing;
+mod utils;
 mod whitelisting;
 
 use anyhow::Context as _;

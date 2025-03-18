@@ -248,6 +248,82 @@ async fn get_player_lobbies(
     }
 }
 
+#[derive(Serialize)]
+struct Achievement {
+    name: String,
+    is_active: bool,
+    display_name: String,
+    description: String,
+}
+
+#[derive(Serialize)]
+struct Achievements {
+    caip2: String,
+    block: u64,
+    id: String,
+    name: String,
+    achievements: Vec<Achievement>,
+}
+
+const CAIP2: &str = "polkadot:00000000000000000000000000000000";
+const PLAYED_FIRST_MATCH_ACHIEVEMENT_ID: &str = "played_first_match";
+
+#[get("/achievements/public/list")]
+async fn get_public_achievements() -> Json<Achievements> {
+    let game = Achievements {
+        caip2: CAIP2.to_string(),
+        block: 0,
+        id: "paima-kachina-kolosseum".to_string(),
+        name: "Kachina Kolosseum".to_string(),
+        achievements: vec![Achievement {
+            name: PLAYED_FIRST_MATCH_ACHIEVEMENT_ID.to_string(),
+            is_active: true,
+            display_name: "Welcome to the Arena".to_string(),
+            description: "Play your first match (win or lose)".to_string(),
+        }],
+    };
+
+    Json(game)
+}
+
+#[derive(serde::Serialize)]
+struct PlayerAchievements {
+    caip2: String,
+    block: u64,
+    wallet: String,
+    completed: u8,
+    achievements: Vec<AchievementStatus>,
+}
+
+#[derive(serde::Serialize)]
+struct AchievementStatus {
+    name: String,
+    completed: bool,
+}
+
+#[get("/achievements/wallet/<player_id>")]
+async fn get_player_achievements(
+    state: &State<AppState>,
+    player_id: String,
+) -> Result<Json<PlayerAchievements>, Error> {
+    let completed = state
+        .db
+        .played_first_match_achievement_completed(player_id.clone())
+        .await
+        .map_err(|e| Error::InternalError(e.to_string()))?;
+
+    Ok(Json(PlayerAchievements {
+        caip2: CAIP2.to_string(),
+        block: 0,
+        wallet: player_id,
+        completed: if completed { 1 } else { 0 },
+        achievements: vec![AchievementStatus {
+            name: PLAYED_FIRST_MATCH_ACHIEVEMENT_ID.to_string(),
+            completed,
+        }],
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn rocket(
     prover_params: Arc<ProvingParams>,
@@ -295,7 +371,9 @@ pub fn rocket(
                 funds,
                 address,
                 get_open_lobbies,
-                get_player_lobbies
+                get_player_lobbies,
+                get_public_achievements,
+                get_player_achievements
             ],
         )
         .attach(cors.to_cors().unwrap())

@@ -215,6 +215,32 @@ impl Db {
         .unwrap()
     }
 
+    pub async fn played_first_match_achievement_completed(
+        &self,
+        public_key: String,
+    ) -> anyhow::Result<bool> {
+        let conn = self.pool.get().await.unwrap();
+
+        let public_key = public_key.to_string();
+
+        conn.interact(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT COUNT(*) FROM contract_address
+                WHERE
+                    (p1_public_key = ?1 OR p2_public_key = ('01;' || ?1) ) AND
+                    (game_state = '07' OR game_state = '08' OR game_state = '09')",
+            )?;
+
+            let row = stmt
+                .query_row([public_key], |row| Ok(row.get::<_, u64>(0)? > 0))
+                .context("Database error")?;
+
+            Ok(row)
+        })
+        .await
+        .unwrap()
+    }
+
     async fn create_tables(&self) -> anyhow::Result<()> {
         let conn = self.pool.get().await.unwrap();
 

@@ -146,8 +146,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Batcher address {}", address);
 
-    let current_tx = maybe_latest_state.map(|(hash, _)| hash);
-
     let sync_status = Arc::new(RwLock::new(SyncStatus::Syncing {
         progress: 0.0,
         notify: None,
@@ -173,7 +171,6 @@ async fn main() -> anyhow::Result<()> {
                     indexer_ws_url.clone(),
                     indexer_http_url.clone(),
                     Arc::clone(&initial_state),
-                    current_tx.clone(),
                     network_id,
                     Arc::clone(&sync_status),
                     Arc::clone(&notify_tx),
@@ -186,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
                     unreachable!("indexer task returned without error");
                 };
 
-                tracing::error!(reason=%error, "sync task stopped, restarting in: {} seconds", sleep_time.as_secs());
+                tracing::error!(reason=?error, "sync task stopped, restarting in: {} seconds", sleep_time.as_secs());
 
                 tokio::time::sleep(sleep_time).await;
             }
@@ -227,12 +224,15 @@ async fn wallet_indexer(
     indexer_ws_url: Url,
     indexer_http_url: Url,
     latest_state: Arc<Mutex<State>>,
-    current_tx: Option<String>,
     network_id: NetworkId,
     sync_status: Arc<RwLock<SyncStatus>>,
     signal: Arc<tokio::sync::Notify>,
     constraints: Option<whitelisting::Constraints>,
 ) -> anyhow::Result<()> {
+    let maybe_latest_state = db.get_state(STABLE_STATE_ID).await?;
+
+    let current_tx = maybe_latest_state.map(|(hash, _)| hash);
+
     // There is no pending state initially
     //
     // For this to be true then no transaction has to be built before the SyncStatus changes.

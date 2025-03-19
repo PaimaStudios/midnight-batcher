@@ -11,6 +11,9 @@ duplicated git dependencies.
 
 ## Local chain usage
 
+First make sure you have [`compactc`](https://docs.midnight.network/relnotes/compact) set up and the `COMPACT_HOME` env var set to the `compactc` directory.
+You must set the environmental vars `ZKIR_PP` and `MIDNIGHT_LEDGER_STATIC_DIR` to the `local-chain-setup/midnight-static-dir/` directory in this repo.
+
 1. Setup the local chain and fund the batcher.
 
 ```sh

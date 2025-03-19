@@ -11,6 +11,8 @@ duplicated git dependencies.
 
 ## Local chain usage
 
+First make sure you have the environmental vars `ZKIR_PP` and `MIDNIGHT_LEDGER_STATIC_DIR` set to the `local-chain-setup/midnight-static-dir/` directory in this repo.
+
 1. Setup the local chain and fund the batcher.
 
 ```sh

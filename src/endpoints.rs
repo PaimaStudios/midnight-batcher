@@ -6,15 +6,7 @@ use crate::{
 };
 use midnight_zswap::serialize::{self, NetworkId};
 use rand::{rngs::OsRng, Rng};
-use rocket::{
-    figment::{
-        providers::{Env, Format as _, Toml},
-        Figment,
-    },
-    http::Method,
-    serde::json::Json,
-    State,
-};
+use rocket::{http::Method, serde::json::Json, State};
 use rocket_cors::{AllowedOrigins, CorsOptions};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -358,11 +350,7 @@ pub fn rocket(
         )
         .allow_credentials(true);
 
-    let figment = Figment::from(rocket::Config::default())
-        .merge(Toml::file("batcher-config.toml").nested())
-        .merge(Env::prefixed("PAIMA_MIDNIGHT_BATCHER_").global());
-
-    rocket::custom(figment)
+    rocket::build()
         .manage(state)
         .mount(
             "/",

@@ -383,15 +383,26 @@ async fn wallet_indexer(
                                 notify: Some(notify),
                             } = &*sync_status
                             {
-                                notify.notify_one();
+                                notify.notify_waiters();
                             }
 
                             *sync_status = SyncStatus::UpToDate;
                         } else {
                             tracing::info!("progress update: {}/{}", pu.synced, pu.total);
+                            let notify = if let SyncStatus::Syncing {
+                                progress: _,
+                                notify,
+                            } = &*sync_status
+                            {
+                                // we need to be careful to not forget about any notifiers awaiting for ready.
+                                notify.clone()
+                            } else {
+                                None
+                            };
+
                             *sync_status = SyncStatus::Syncing {
                                 progress: (pu.synced / pu.total) * 100.0,
-                                notify: None,
+                                notify,
                             };
                         }
 

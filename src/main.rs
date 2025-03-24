@@ -222,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&sync_status),
     ));
 
-    tokio::task::spawn(async move {
+    let rocket_task_handle = tokio::task::spawn(async move {
         endpoints::rocket(
             proving_params,
             api,
@@ -236,13 +236,22 @@ async fn main() -> anyhow::Result<()> {
         )
         .launch()
         .await
-        .unwrap();
+        .expect("the webserver shouldn't ever stop running");
     });
 
-    // Just exit if the indexer task panics for some unknown reason (like
-    // failing to deserialize a transaction), instead of just having broken
-    // endpoints.
-    indexer_task_handle.await.unwrap();
+    tokio::select! {
+        _ = rocket_task_handle => {
+            tracing::info!("Rocket task finished");
+        },
+        // Just exit if the indexer task panics for some unknown reason (like
+        // failing to deserialize a transaction), instead of just having broken
+        // endpoints.
+        // NOTE: non-panic errors are catched inside the task, so we should only
+        // be here because of a panic.
+        _ = indexer_task_handle => {
+            tracing::error!("indexer task aborted");
+        }
+    };
 
     Ok(())
 }

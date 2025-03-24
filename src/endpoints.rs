@@ -41,6 +41,7 @@ struct SubmitTxResponse {
 struct GetFundsResponse {
     coins: Vec<(String, String)>,
     pending: Vec<String>,
+    sync_progress: f64,
 }
 
 #[derive(Serialize)]
@@ -143,8 +144,6 @@ async fn submit_tx(
 
 #[get("/funds")]
 async fn funds(state: &State<AppState>) -> Result<Json<GetFundsResponse>, Error> {
-    check_is_wallet_in_sync(state).await?;
-
     let lock = state.zswap_state.lock().await;
 
     let coins = lock
@@ -167,7 +166,21 @@ async fn funds(state: &State<AppState>) -> Result<Json<GetFundsResponse>, Error>
         })
         .collect();
 
-    Ok(Json(GetFundsResponse { coins, pending }))
+    let sync_status = state.sync_status.read().await;
+
+    let progress = match *sync_status {
+        SyncStatus::Syncing {
+            progress,
+            notify: _,
+        } => progress,
+        SyncStatus::UpToDate => 100.0,
+    };
+
+    Ok(Json(GetFundsResponse {
+        coins,
+        pending,
+        sync_progress: progress,
+    }))
 }
 
 #[get("/address")]

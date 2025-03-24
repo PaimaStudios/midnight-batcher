@@ -155,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
 
     let notify_tx = Arc::new(tokio::sync::Notify::new());
 
-    {
+    let indexer_task_handle = {
         let initial_state = Arc::clone(&initial_state);
         let sync_status = Arc::clone(&sync_status);
         let notify_tx = Arc::clone(&notify_tx);
@@ -185,10 +185,32 @@ async fn main() -> anyhow::Result<()> {
 
                 tracing::error!(reason=?error, "sync task stopped, restarting in: {} seconds", sleep_time.as_secs());
 
+                let mut sync_status = sync_status.write().await;
+
+                let (notify, progress) =
+                    if let SyncStatus::Syncing { progress, notify } = &*sync_status {
+                        (notify.clone(), Some(*progress))
+                    } else {
+                        (None, None)
+                    };
+
+                // doing this will cause the submit endpoint to return
+                // Service Unavailable instead of another error (like no funds
+                // available).
+                *sync_status = SyncStatus::Syncing {
+                    progress: progress
+                        // this happens when the SyncStatus was UpToDate but
+                        // something fails, we don't really have a more useful
+                        // number to put here, so just make it a 100.0 so it's
+                        // clearer that we already got to the tip.
+                        .unwrap_or(100.0),
+                    notify,
+                };
+
                 tokio::time::sleep(sleep_time).await;
             }
-        });
-    }
+        })
+    };
 
     let (pre_proving_comm_tx, pre_proving_comm_rx) = tokio::sync::mpsc::channel(1000);
 
@@ -200,20 +222,27 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&sync_status),
     ));
 
-    endpoints::rocket(
-        proving_params,
-        api,
-        initial_state,
-        network_id,
-        sync_status,
-        pre_proving_comm_tx,
-        whitelisting,
-        db,
-        address,
-    )
-    .launch()
-    .await
-    .unwrap();
+    tokio::task::spawn(async move {
+        endpoints::rocket(
+            proving_params,
+            api,
+            initial_state,
+            network_id,
+            sync_status,
+            pre_proving_comm_tx,
+            whitelisting,
+            db,
+            address,
+        )
+        .launch()
+        .await
+        .unwrap();
+    });
+
+    // Just exit if the indexer task panics for some unknown reason (like
+    // failing to deserialize a transaction), instead of just having broken
+    // endpoints.
+    indexer_task_handle.await.unwrap();
 
     Ok(())
 }
@@ -233,12 +262,11 @@ async fn wallet_indexer(
 
     let current_tx = maybe_latest_state.map(|(hash, _)| hash);
 
-    // There is no pending state initially
-    //
-    // For this to be true then no transaction has to be built before the SyncStatus changes.
     let mut confirmed_state = latest_state.lock().await.clone();
 
-    let mut req = indexer_ws_url.into_client_request().unwrap();
+    let mut req = indexer_ws_url
+        .into_client_request()
+        .context("into_client_request error")?;
 
     req.headers_mut().insert(
         "Sec-WebSocket-Protocol",
@@ -427,10 +455,13 @@ async fn wallet_indexer(
                 let block_number = transaction.block.height;
 
                 let tx: Transaction<Proof> = deserialize::<Transaction<Proof>, _>(
-                    std::io::Cursor::new(hex::decode(raw_tx).unwrap()),
+                    std::io::Cursor::new(
+                        hex::decode(raw_tx).expect("Expected raw transaction to be hex encoded"),
+                    ),
                     network_id,
                 )
-                .unwrap();
+                // there is no point in re-trying to connect if the problem is that we can't deserialize a tx, so we just panic to skip the reconnection loop.
+                .expect("Failed to deserialize tx");
 
                 let current_coins = confirmed_state.coins.clone();
 
@@ -466,9 +497,19 @@ async fn wallet_indexer(
                             .json()
                             .await?;
 
-                        let state_raw =
-                            hex::decode(res["data"]["contract"]["state"].as_str().unwrap())
-                                .unwrap();
+                        let state_raw = res
+                            .get("data")
+                            .and_then(|data| data.get("contract"))
+                            .and_then(|contract| contract.get("state"))
+                            .and_then(|state| state.as_str())
+                            .ok_or(anyhow::anyhow!(
+                                "Unexpected format for contract state query {}",
+                                res.to_string()
+                            ))?;
+
+                        let state_raw = hex::decode(state_raw).context(anyhow::anyhow!(
+                            "Expected hex string for the contract statestate"
+                        ))?;
 
                         let state: ContractState =
                             deserialize(std::io::Cursor::new(state_raw), network_id)?;
@@ -582,13 +623,6 @@ async fn wallet_indexer(
             Ok(_) => {}
             Err(e) => {
                 tracing::error!("graphql suscription error: {}", e);
-
-                *sync_status.write().await = SyncStatus::Syncing {
-                    // technically not correct, but this is not used for anything useful anyway.
-                    progress: 0.0,
-                    notify: None,
-                };
-
                 anyhow::bail!("graphql subscription error: {}", e);
             }
         }

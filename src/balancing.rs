@@ -79,7 +79,9 @@ pub fn decode_zswap_proof_params(
 }
 
 pub fn read_kzg_params() -> anyhow::Result<ParamsProver> {
-    let pp = concat!(env!("MIDNIGHT_LEDGER_STATIC_DIR"), "/kzg");
+    let pp = std::env::var("MIDNIGHT_LEDGER_STATIC_DIR")
+        .context("MIDNIGHT_LEDGER_STATIC_DIR not set")?
+        + "/kzg";
 
     ParamsProver::read(BufReader::new(
         File::open(pp).expect("failed to read kzg params"),

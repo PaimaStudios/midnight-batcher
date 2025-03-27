@@ -497,7 +497,7 @@ async fn wallet_indexer(
                             .clone()
                             .into_iter()
                             .rev()
-                            .take(3)
+                            .take(4)
                             .rev()
                             .map(|state_var| {
                                 let mut joined = state_var
@@ -543,6 +543,7 @@ async fn wallet_indexer(
                             &mapped_entries[0],
                             &mapped_entries[1],
                             &mapped_entries[2],
+                            &mapped_entries[3],
                             block_number,
                         )
                         .await?;

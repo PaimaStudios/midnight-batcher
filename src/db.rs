@@ -121,6 +121,7 @@ impl Db {
         game_state: &str,
         p1_public_key: &str,
         p2_public_key: &str,
+        public: &str,
         block_number: u64,
     ) -> anyhow::Result<()> {
         let conn = self.pool.get().await.unwrap();
@@ -129,11 +130,12 @@ impl Db {
         let game_state = game_state.to_string();
         let p1_public_key = p1_public_key.to_string();
         let p2_public_key = p2_public_key.to_string();
+        let public = public.to_string();
 
         conn.interact(move |conn| {
             conn.execute(
-                "UPDATE contract_address SET game_state = ?1, p1_public_key = ?2, p2_public_key = ?3, block_number = ?5 WHERE id = ?4 ",
-                (game_state, p1_public_key, p2_public_key, contract_address, block_number),
+                "UPDATE contract_address SET game_state = ?1, p1_public_key = ?2, p2_public_key = ?3, block_number = ?5, public = ?6 WHERE id = ?4 ",
+                (game_state, p1_public_key, p2_public_key, contract_address, block_number, public),
             )
         })
         .await
@@ -154,7 +156,7 @@ impl Db {
             let mut stmt = conn.prepare(
                 "
                 SELECT id, block_number, p1_public_key FROM contract_address
-                WHERE p2_public_key = '00;' AND
+                WHERE p2_public_key = '00;' AND public = '01' AND
                     (?1 IS NULL OR rowid < (SELECT max(rowid) FROM contract_address WHERE id = ?1)) AND
                     (?3 IS NULL OR p1_public_key <> ?3)
                 ORDER BY rowid DESC
@@ -260,6 +262,7 @@ impl Db {
                 game_state TEXT,
                 p1_public_key TEXT,
                 p2_public_key TEXT,
+                public TEXT,
                 block_number INTEGER
             )",
                 (),

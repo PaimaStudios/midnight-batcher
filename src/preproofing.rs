@@ -13,7 +13,10 @@ use midnight_zswap::{
 };
 use rand::rngs::OsRng;
 use std::{cmp::Reverse, collections::HashMap, sync::Arc};
-use tokio::{runtime::Handle, sync::Mutex};
+use tokio::{
+    runtime::Handle,
+    sync::{Mutex, OnceCell},
+};
 use tracing::{info_span, Instrument as _};
 
 #[derive(Clone)]
@@ -142,18 +145,43 @@ pub async fn pre_proving_service(
     }
 }
 
+static MIDNIGHT_DATA_PROVIDER: OnceCell<MidnightDataProvider> = OnceCell::const_new();
+
+async fn fetch_proof_params() -> &'static MidnightDataProvider {
+    // just in case, make sure we fetch all the files we need inside a lock.
+    MIDNIGHT_DATA_PROVIDER
+        .get_or_init(|| async {
+            let midnight_data_provider = MidnightDataProvider::new(
+                FetchMode::Synchronous,
+                OutputMode::Log,
+                ZSWAP_EXPECTED_FILES.to_vec(),
+            );
+
+            for zswap_file in ZSWAP_EXPECTED_FILES {
+                midnight_data_provider.fetch(zswap_file.0).await.unwrap();
+            }
+
+            midnight_data_provider
+                .fetch("bls_filecoin_2p15")
+                .await
+                .unwrap();
+
+            midnight_data_provider
+                .fetch("bls_filecoin_2p14")
+                .await
+                .unwrap();
+
+            midnight_data_provider
+        })
+        .await
+}
+
 pub async fn prove_tx_in_rayon_pool(
     tx: Transaction<ProofPreimage, InMemoryDB>,
 ) -> Transaction<Proof, InMemoryDB> {
     let (oneshot_tx, oneshot_rx) = tokio::sync::oneshot::channel();
 
-    // TODO: maybe don't want to initialize this every time?
-    let midnight_data_provider = MidnightDataProvider::new(
-        // and also having this be OnDemand may lead to races the first time
-        FetchMode::OnDemand,
-        OutputMode::Log,
-        ZSWAP_EXPECTED_FILES.to_vec(),
-    );
+    let midnight_data_provider = fetch_proof_params().await.clone();
 
     {
         tokio::task::spawn_blocking(move || {
@@ -167,7 +195,6 @@ pub async fn prove_tx_in_rayon_pool(
             let tokio_handle = Handle::current();
 
             let now = std::time::Instant::now();
-            tracing::info!("blocking on {:?}", std::thread::current().id());
             let proof = tokio_handle.block_on(tx.prove(OsRng, &midnight_data_provider, &resolver));
             tracing::info!("input proven in {} ms", now.elapsed().as_millis());
 

@@ -4,30 +4,33 @@ extern crate rocket;
 mod balancing;
 mod db;
 mod endpoints;
+mod graphql_deser;
 mod preproofing;
+mod sync_status;
 mod utils;
 mod whitelisting;
 
 use anyhow::Context as _;
-use balancing::ProvingParams;
 use clap::{arg, Command};
 use db::Db;
 use futures::{SinkExt, StreamExt};
 use midnight_ledger::onchain_runtime::state::{ContractState, StateValue};
 use midnight_ledger::onchain_runtime::state_value_ext::StateValueExt;
-use midnight_ledger::structure::Transaction;
-use midnight_transient_crypto::proofs::Proof;
+use midnight_ledger::structure::{Proof, Transaction, TransactionHash};
 use midnight_zswap::base_crypto::fab::{AlignmentAtom, AlignmentSegment};
+use midnight_zswap::keys::{SecretKeys, Seed};
 use midnight_zswap::local::State;
 use midnight_zswap::serialize::{deserialize, NetworkId, Serializable};
+use midnight_zswap::storage::db::InMemoryDB;
 use preproofing::pre_proving_service;
-use rand::SeedableRng as _;
-use rand_chacha::ChaCha20Rng;
+// use rand::SeedableRng as _;
+// use rand_chacha::ChaCha20Rng;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use subxt::{OnlineClient, SubstrateConfig};
-use tokio::sync::{Mutex, RwLock};
+use sync_status::{SharedSyncStatus, SyncStatus};
+use tokio::sync::Mutex;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{self, client::IntoClientRequest, http::HeaderValue},
@@ -42,15 +45,7 @@ const NODE_LOCALHOST: &str = "ws://127.0.0.1:9944";
 #[subxt::subxt(runtime_metadata_path = "metadata.scale")]
 pub mod midnight {}
 
-pub enum SyncStatus {
-    Syncing {
-        progress: f64,
-        notify: Option<Arc<tokio::sync::Notify>>,
-    },
-    UpToDate,
-}
-
-fn address(zswap_state: &State) -> String {
+fn address(zswap_state: &SecretKeys) -> String {
     let pk = zswap_state.coin_public_key();
     let epk = zswap_state.enc_public_key();
 
@@ -124,58 +119,75 @@ async fn main() -> anyhow::Result<()> {
     let indexer_ws_url = Url::parse(ws_indexer).context("Invalid indexer ws URL")?;
     let indexer_http_url = Url::parse(http_indexer).context("Invalid indexer http URL")?;
 
-    let proving_params = Arc::new(ProvingParams::new()?);
-
     let db = Db::open_db(db, network_id).await?;
 
     let seed = std::fs::read_to_string(credentials).context("Failed to read credentials")?;
 
-    let mut rng = ChaCha20Rng::from_seed(
-        <[u8; 32]>::try_from(hex::decode(seed.trim()).context("seed should be a valid hex")?)
-            .map_err(|_| anyhow::anyhow!("expected seed to contain 32 bytes"))?,
-    );
+    // let mut rng = ChaCha20Rng::from_seed(
+    //     <[u8; 32]>::try_from(hex::decode(seed.trim()).context("seed should be a valid hex")?)
+    //         .map_err(|_| anyhow::anyhow!("expected seed to contain 32 bytes"))?,
+    // );
 
     let maybe_latest_state = db.get_state(STABLE_STATE_ID).await?;
+
+    // let secret_keys = SecretKeys::from_rng_seed(&mut rng);
+    let secret_keys = SecretKeys::from(Seed::from(
+        <[u8; 32]>::try_from(hex::decode(seed.trim()).context("seed should be a valid hex")?)
+            .map_err(|_| anyhow::anyhow!("expected seed to contain 32 bytes"))?,
+    ));
 
     let initial_state = maybe_latest_state
         .as_ref()
         .map(|(_, state)| state.clone())
-        .unwrap_or_else(|| State::new(&mut rng));
+        .unwrap_or_else(State::new);
 
-    let address = address(&initial_state);
+    let address = address(&secret_keys);
 
     info!("Batcher address {}", address);
 
-    let sync_status = Arc::new(RwLock::new(SyncStatus::Syncing {
+    let sync_status = sync_status::SharedSyncStatus::new(SyncStatus::Syncing {
         progress: 0.0,
         notify: None,
-    }));
+    });
 
     let initial_state = Arc::new(Mutex::new(initial_state));
 
     let notify_tx = Arc::new(tokio::sync::Notify::new());
 
+    let client = reqwest::Client::new();
+
+    let session_id = connect_wallet_to_indexer(&indexer_http_url, &secret_keys, &client).await?;
+
     let indexer_task_handle = {
         let initial_state = Arc::clone(&initial_state);
-        let sync_status = Arc::clone(&sync_status);
+        let sync_status = sync_status.clone();
         let notify_tx = Arc::clone(&notify_tx);
         let whitelisting = whitelisting.clone();
         let db = db.clone();
+        let secret_keys = secret_keys.clone();
+        let client = client.clone();
+        let indexer_http_url = indexer_http_url.clone();
+        let session_id = session_id.clone();
 
         tokio::task::spawn(async move {
-            let sleep_time = std::time::Duration::from_secs(60);
+            let sleep_time = std::time::Duration::from_secs(10);
 
             loop {
                 let err = wallet_indexer(
                     db.clone(),
-                    indexer_ws_url.clone(),
-                    indexer_http_url.clone(),
+                    IndexerUrls {
+                        indexer_ws_url: indexer_ws_url.clone(),
+                        indexer_http_url: indexer_http_url.clone(),
+                    },
                     Arc::clone(&initial_state),
                     network_id,
-                    Arc::clone(&sync_status),
+                    sync_status.clone(),
                     Arc::clone(&notify_tx),
                     // TODO: maybe this is too big? but shouldn't be
                     whitelisting.clone(),
+                    secret_keys.clone(),
+                    client.clone(),
+                    session_id.clone(),
                 )
                 .await;
 
@@ -185,27 +197,10 @@ async fn main() -> anyhow::Result<()> {
 
                 tracing::error!(reason=?error, "sync task stopped, restarting in: {} seconds", sleep_time.as_secs());
 
-                let mut sync_status = sync_status.write().await;
-
-                let (notify, progress) =
-                    if let SyncStatus::Syncing { progress, notify } = &*sync_status {
-                        (notify.clone(), Some(*progress))
-                    } else {
-                        (None, None)
-                    };
-
                 // doing this will cause the submit endpoint to return
                 // Service Unavailable instead of another error (like no funds
                 // available).
-                *sync_status = SyncStatus::Syncing {
-                    progress: progress
-                        // this happens when the SyncStatus was UpToDate but
-                        // something fails, we don't really have a more useful
-                        // number to put here, so just make it a 100.0 so it's
-                        // clearer that we already got to the tip.
-                        .unwrap_or(100.0),
-                    notify,
-                };
+                sync_status.on_indexer_fail().await;
 
                 tokio::time::sleep(sleep_time).await;
             }
@@ -216,15 +211,14 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::task::spawn(pre_proving_service(
         Arc::clone(&initial_state),
-        Arc::clone(&proving_params),
         notify_tx,
         pre_proving_comm_rx,
-        Arc::clone(&sync_status),
+        sync_status.clone(),
+        secret_keys.clone(),
     ));
 
     let rocket_task_handle = tokio::task::spawn(async move {
         endpoints::rocket(
-            proving_params,
             api,
             initial_state,
             network_id,
@@ -233,6 +227,7 @@ async fn main() -> anyhow::Result<()> {
             whitelisting,
             db,
             address,
+            secret_keys.clone(),
         )
         .launch()
         .await
@@ -253,27 +248,43 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    if let Err(err) = session_id.disconnect(&indexer_http_url, &client).await {
+        tracing::warn!(reason = ?err, "error while disconnecting wallet");
+    }
+
     Ok(())
+}
+
+struct IndexerUrls {
+    indexer_ws_url: Url,
+    indexer_http_url: Url,
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn wallet_indexer(
     db: Db,
-    indexer_ws_url: Url,
-    indexer_http_url: Url,
-    latest_state: Arc<Mutex<State>>,
+    indexer_urls: IndexerUrls,
+    latest_state: Arc<Mutex<State<InMemoryDB>>>,
     network_id: NetworkId,
-    sync_status: Arc<RwLock<SyncStatus>>,
+    sync_status: SharedSyncStatus,
     signal: Arc<tokio::sync::Notify>,
     constraints: Option<whitelisting::Constraints>,
+    secret_keys: SecretKeys,
+    client: reqwest::Client,
+    session_id: SessionId,
 ) -> anyhow::Result<()> {
     let maybe_latest_state = db.get_state(STABLE_STATE_ID).await?;
 
-    let current_tx = maybe_latest_state.map(|(hash, _)| hash);
+    let start_from = maybe_latest_state
+        .map(|(start_index, _)| start_index + 1)
+        .unwrap_or(0);
+
+    tracing::info!("starting sync from {}", start_from);
 
     let mut confirmed_state = latest_state.lock().await.clone();
 
-    let mut req = indexer_ws_url
+    let mut req = indexer_urls
+        .indexer_ws_url
         .into_client_request()
         .context("into_client_request error")?;
 
@@ -308,36 +319,46 @@ async fn wallet_indexer(
         .ok_or_else(|| anyhow::anyhow!("expected a message"))?
         .context("graphql subscription error")?;
 
-    let _message = read
-        .next()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("expected a message"))?
-        .context("graphql subscription error")?;
+    let subscription_query = {
+        let query = format!(
+            r#"subscription {{
+                        wallet(sessionId: "{}", index: {}, sendProgressUpdates: true) {{
+                            __typename
+                            ... on ProgressUpdate {{
+                                    highestIndex
+                                    highestRelevantIndex
+                                    highestRelevantWalletIndex
 
-    let subscription_query = |start: Option<String>| {
-        if let Some(start) = start {
-            json!({
-                "id": "2",
-                "type": "start",
-                "payload": {
-                    "query": format!(r#"subscription{{ transactions(offset: {{hash: "{}" }}) {{__typename ... on TransactionAdded {{ transaction {{ hash raw applyStage block {{ hash height }} }} }} ... on ProgressUpdate {{synced total}} }} }}"#, start)
-                }
-            })
-        } else {
-            json!({
-                "id": "2",
-                "type": "start",
-                "payload": {
-                    "query":"subscription{transactions {__typename ... on TransactionAdded { transaction { hash raw block { hash height } applyStage }} ... on ProgressUpdate {synced total} } }"
-                }
-            })
-        }
-    };
+                            }}
+                            ... on ViewingUpdate {{
+                                index
+                                update {{
+                                    __typename
+                                    ... on MerkleTreeCollapsedUpdate {{
+                                        protocolVersion
+                                        start
+                                        end
+                                        update
+                                    }}
+                                    ... on RelevantTransaction {{
+                                        start
+                                        end
+                                        transaction {{ hash raw applyStage block {{ hash height }} }}
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }}"#,
+            session_id.0, start_from
+        );
 
-    let (subscription_query, mut skip_first) = if let Some(txhash) = current_tx {
-        (subscription_query(Some(txhash)), true)
-    } else {
-        (subscription_query(None), false)
+        json!({
+            "id": "2",
+            "type": "start",
+            "payload": {
+                "query": query
+            }
+        })
     };
 
     write
@@ -348,58 +369,7 @@ async fn wallet_indexer(
     while let Some(message) = read.next().await {
         match message {
             Ok(tungstenite::Message::Text(text)) => {
-                mod gql {
-                    use serde::Deserialize;
-
-                    #[derive(Debug, Deserialize)]
-                    #[serde(tag = "__typename")]
-                    pub enum TransactionOrUpdate {
-                        TransactionAdded(Transaction),
-                        ProgressUpdate(ProgressUpdate),
-                    }
-
-                    #[derive(Debug, Deserialize)]
-                    pub struct Transaction {
-                        pub transaction: TransactionAdded,
-                    }
-
-                    #[derive(Debug, Deserialize)]
-                    pub struct TransactionBlock {
-                        pub height: u64,
-                    }
-
-                    #[derive(Debug, Deserialize)]
-                    pub struct TransactionAdded {
-                        pub hash: String,
-                        #[serde(rename = "applyStage")]
-                        pub apply_stage: String,
-                        pub raw: String,
-                        pub block: TransactionBlock,
-                    }
-
-                    #[derive(Debug, Deserialize)]
-                    pub struct ProgressUpdate {
-                        pub synced: f64,
-                        pub total: f64,
-                    }
-
-                    #[derive(Debug, Deserialize)]
-                    pub struct Transactions {
-                        pub transactions: TransactionOrUpdate,
-                    }
-
-                    #[derive(Debug, Deserialize)]
-                    pub struct Data {
-                        pub data: Transactions,
-                    }
-
-                    #[derive(Debug, Deserialize)]
-                    pub struct Val {
-                        pub payload: Data,
-                    }
-                }
-
-                let val: gql::Val = match serde_json::from_str(&text) {
+                let val: graphql_deser::Val = match serde_json::from_str(&text) {
                     Ok(val) => val,
                     Err(error) => {
                         tracing::error!("raw text: {}", text);
@@ -410,224 +380,45 @@ async fn wallet_indexer(
                     }
                 };
 
-                let transaction = match val.payload.data.transactions {
-                    gql::TransactionOrUpdate::TransactionAdded(tx_added) => tx_added.transaction,
-                    gql::TransactionOrUpdate::ProgressUpdate(pu) => {
-                        let mut sync_status = sync_status.write().await;
-                        if (pu.synced / pu.total) > 0.95 {
-                            if let SyncStatus::Syncing {
-                                progress: _,
-                                notify: Some(notify),
-                            } = &*sync_status
-                            {
-                                notify.notify_waiters();
-                            }
-
-                            *sync_status = SyncStatus::UpToDate;
-                        } else {
-                            tracing::info!("progress update: {}/{}", pu.synced, pu.total);
-                            let notify = if let SyncStatus::Syncing {
-                                progress: _,
-                                notify,
-                            } = &*sync_status
-                            {
-                                // we need to be careful to not forget about any notifiers awaiting for ready.
-                                notify.clone()
-                            } else {
-                                None
-                            };
-
-                            *sync_status = SyncStatus::Syncing {
-                                progress: (pu.synced / pu.total) * 100.0,
-                                notify,
-                            };
-                        }
-
+                let updates = match val.payload.data.wallet {
+                    graphql_deser::TransactionOrUpdate::ViewingUpdate(tx_added) => tx_added.update,
+                    graphql_deser::TransactionOrUpdate::ProgressUpdate(pu) => {
+                        sync_status.update(pu).await;
                         continue;
                     }
                 };
 
-                if skip_first {
-                    skip_first = false;
-                    continue;
-                }
-
-                let tx_hash = transaction.hash;
-
-                let apply_stage = transaction.apply_stage;
-
-                if apply_stage == "FailEntirely" {
-                    continue;
-                }
-
-                let raw_tx = transaction.raw;
-                let block_number = transaction.block.height;
-
-                let tx: Transaction<Proof> = deserialize::<Transaction<Proof>, _>(
-                    std::io::Cursor::new(
-                        hex::decode(raw_tx).expect("Expected raw transaction to be hex encoded"),
-                    ),
-                    network_id,
-                )
-                // there is no point in re-trying to connect if the problem is that we can't deserialize a tx, so we just panic to skip the reconnection loop.
-                .expect("Failed to deserialize tx");
-
-                let current_coins = confirmed_state.coins.clone();
-
-                let mut unconfirmed_state_guard = latest_state.lock().await;
-                let mut unconfirmed_state = unconfirmed_state_guard.clone();
-
-                if let Some(constraints) = constraints.as_ref() {
-                    let deploy_address = whitelisting::check_deploy(constraints, &tx, network_id)?;
-
-                    if let Some(deploy_address) = &deploy_address {
-                        db.insert_contract_address(deploy_address).await?;
-
-                        tracing::info!("detected new contract address: {}", deploy_address);
-                    }
-
-                    let contract_call_address =
-                        whitelisting::check_call(&db, &tx, network_id).await?;
-
-                    if let Some(contract_address) = deploy_address.or(contract_call_address) {
-                        let tx_hash = tx.transaction_hash();
-
-                        let res: serde_json::Value = reqwest::Client::new()
-                            .post(indexer_http_url.to_string())
-                            .json(&json!({
-                                "query": format!(r#"{{
-                            contract(address: "{}", transactionOffset: {{ hash: "{}" }} ) {{
-                                state
-                            }}
-                        }}"#, contract_address, hex::encode(tx_hash.0.0)),
-                            }))
-                            .send()
+                for update in updates {
+                    match update {
+                        graphql_deser::ZswapChainStateUpdate::RelevantTransaction(update) => {
+                            process_transaction(
+                                update,
+                                network_id,
+                                &db,
+                                &indexer_urls.indexer_http_url,
+                                &latest_state,
+                                &signal,
+                                &constraints,
+                                &secret_keys,
+                                &client,
+                                &mut confirmed_state,
+                            )
                             .await?
-                            .json()
+                        }
+                        graphql_deser::ZswapChainStateUpdate::MerkleTreeCollapsedUpdate(
+                            collapsed_update,
+                        ) => {
+                            process_collapsed_update(
+                                &db,
+                                &latest_state,
+                                network_id,
+                                &mut confirmed_state,
+                                collapsed_update,
+                            )
                             .await?;
-
-                        let state_raw = res
-                            .get("data")
-                            .and_then(|data| data.get("contract"))
-                            .and_then(|contract| contract.get("state"))
-                            .and_then(|state| state.as_str())
-                            .ok_or(anyhow::anyhow!(
-                                "Unexpected format for contract state query {}",
-                                res.to_string()
-                            ))?;
-
-                        let state_raw = hex::decode(state_raw).context(anyhow::anyhow!(
-                            "Expected hex string for the contract statestate"
-                        ))?;
-
-                        let state: ContractState =
-                            deserialize(std::io::Cursor::new(state_raw), network_id)?;
-
-                        let mut flattened_entries = vec![];
-                        match &state.data {
-                            StateValue::Array(arr) => {
-                                for entry in arr.iter() {
-                                    match &*entry {
-                                        StateValue::Array(arr) => {
-                                            for entry in arr.iter() {
-                                                flattened_entries.push(entry.as_cell().unwrap())
-                                            }
-                                        }
-                                        StateValue::Cell(cell) => {
-                                            flattened_entries.push(Arc::clone(cell));
-                                        }
-                                        _ => todo!(),
-                                    }
-                                }
-                            }
-                            _ => todo!(),
-                        }
-
-                        let mapped_entries = flattened_entries
-                            .clone()
-                            .into_iter()
-                            .rev()
-                            .take(3)
-                            .rev()
-                            .map(|state_var| {
-                                let mut joined = state_var
-                                    .value
-                                    .0
-                                    .iter()
-                                    .zip(state_var.alignment.0.iter())
-                                    .map(|(value, alignment)| match &alignment {
-                                        AlignmentSegment::Atom(atom) => match &atom {
-                                            AlignmentAtom::Compress => "".to_string(),
-                                            AlignmentAtom::Bytes { length } => {
-                                                let mut s = hex::encode(&value.0);
-
-                                                if let Some(missing_zeroes) =
-                                                    (*length as usize).checked_sub(value.0.len())
-                                                {
-                                                    s.extend(
-                                                        std::iter::repeat('0')
-                                                            .take(missing_zeroes * 2),
-                                                    );
-                                                }
-
-                                                s
-                                            }
-                                            AlignmentAtom::Field => hex::encode(&value.0),
-                                        },
-                                        _ => todo!(),
-                                    })
-                                    .fold(String::new(), |mut s, v| {
-                                        s.push_str(&v);
-                                        s.push(';');
-                                        s
-                                    });
-
-                                joined.pop();
-
-                                joined
-                            })
-                            .collect::<Vec<_>>();
-
-                        db.update_contract_state(
-                            &contract_address,
-                            &mapped_entries[0],
-                            &mapped_entries[1],
-                            &mapped_entries[2],
-                            block_number,
-                        )
-                        .await?;
-                    }
-                }
-
-                match tx {
-                    Transaction::Standard(stx) => {
-                        confirmed_state = confirmed_state.apply(&stx.guaranteed_coins);
-                        unconfirmed_state = unconfirmed_state.apply(&stx.guaranteed_coins);
-
-                        if let Some(fallible_coins) = &stx.fallible_coins {
-                            confirmed_state = confirmed_state.apply(fallible_coins);
-                            unconfirmed_state = unconfirmed_state.apply(fallible_coins);
                         }
                     }
-                    Transaction::ClaimMint(cmtx) => {
-                        confirmed_state = confirmed_state.apply_mint(&cmtx.mint);
-                        unconfirmed_state = unconfirmed_state.apply_mint(&cmtx.mint);
-                    }
                 }
-
-                *unconfirmed_state_guard = unconfirmed_state;
-
-                if current_coins == confirmed_state.coins {
-                    continue;
-                }
-
-                signal.notify_waiters();
-
-                db.persist_state(STABLE_STATE_ID, &tx_hash, &confirmed_state)
-                    .await?;
-
-                // dbg!(&confirmed_state.coins);
-                // dbg!(&confirmed_state.merkle_tree);
             }
             Ok(_) => {}
             Err(e) => {
@@ -638,4 +429,296 @@ async fn wallet_indexer(
     }
 
     Ok(())
+}
+
+async fn process_collapsed_update(
+    db: &Db,
+    latest_state: &Arc<Mutex<State<InMemoryDB>>>,
+    network_id: NetworkId,
+    confirmed_state: &mut State<InMemoryDB>,
+    collapsed_update: graphql_deser::MerkleTreeCollapsedUpdate,
+) -> Result<(), anyhow::Error> {
+    let collapsed_update_raw = hex::decode(collapsed_update.update)
+        .context("expected raw collapsed update to be in hex")?;
+    let collapsed_update = deserialize::<
+        midnight_transient_crypto::merkle_tree::MerkleTreeCollapsedUpdate,
+        _,
+    >(std::io::Cursor::new(collapsed_update_raw), network_id)
+    .context("Collapsed update can't be deserialized")?;
+    *confirmed_state = confirmed_state.apply_collapsed_update(&collapsed_update)?;
+    let mut unconfirmed_state_guard = latest_state.lock().await;
+    *unconfirmed_state_guard = unconfirmed_state_guard.apply_collapsed_update(&collapsed_update)?;
+    db.persist_state(STABLE_STATE_ID, collapsed_update.start, &*confirmed_state)
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_transaction(
+    update: graphql_deser::RelevantTransaction,
+    network_id: NetworkId,
+    db: &Db,
+    indexer_http_url: &Url,
+    latest_state: &Arc<Mutex<State<InMemoryDB>>>,
+    signal: &Arc<tokio::sync::Notify>,
+    constraints: &Option<whitelisting::Constraints>,
+    secret_keys: &SecretKeys,
+    client: &reqwest::Client,
+    confirmed_state: &mut State<InMemoryDB>,
+) -> anyhow::Result<()> {
+    let transaction = update.transaction;
+
+    let apply_stage = transaction.apply_stage;
+
+    if apply_stage == "FailEntirely" {
+        return Ok(());
+    }
+
+    let tx_raw = hex::decode(transaction.raw).context("expected raw transaction to be in hex")?;
+
+    let tx: Transaction<Proof, InMemoryDB> =
+        deserialize::<Transaction<Proof, InMemoryDB>, _>(std::io::Cursor::new(tx_raw), network_id)
+            .context("Transaction can't be deserialized")?;
+
+    let current_coins = confirmed_state.coins.clone();
+    let mut unconfirmed_state_guard = latest_state.lock().await;
+
+    if let Some(constraints) = constraints.as_ref() {
+        let deploy_address = whitelisting::check_deploy(constraints, &tx, network_id)?;
+
+        if let Some(deploy_address) = &deploy_address {
+            db.insert_contract_address(deploy_address).await?;
+
+            tracing::info!("detected new contract address: {}", deploy_address);
+        }
+
+        let contract_call_address = whitelisting::check_call(db, &tx, network_id).await?;
+
+        if let Some(contract_address) = deploy_address.or(contract_call_address) {
+            game_specific_indexing(
+                network_id,
+                db,
+                indexer_http_url,
+                client,
+                transaction.block.height,
+                tx.transaction_hash(),
+                contract_address,
+            )
+            .await?;
+        }
+    }
+
+    let mut unconfirmed_state = unconfirmed_state_guard.clone();
+
+    match tx {
+        Transaction::Standard(stx) => {
+            *confirmed_state = confirmed_state.apply(secret_keys, &stx.guaranteed_coins);
+            unconfirmed_state = unconfirmed_state.apply(secret_keys, &stx.guaranteed_coins);
+
+            if let Some(fallible_coins) = &stx.fallible_coins {
+                *confirmed_state = confirmed_state.apply(secret_keys, fallible_coins);
+                unconfirmed_state = unconfirmed_state.apply(secret_keys, fallible_coins);
+            }
+        }
+        Transaction::ClaimMint(cmtx) => {
+            *confirmed_state = confirmed_state.apply_mint(secret_keys, &cmtx.mint);
+            unconfirmed_state = unconfirmed_state.apply_mint(secret_keys, &cmtx.mint);
+        }
+    }
+
+    *unconfirmed_state_guard = unconfirmed_state;
+
+    if current_coins == confirmed_state.coins {
+        return Ok(());
+    }
+
+    signal.notify_waiters();
+
+    db.persist_state(STABLE_STATE_ID, update.start, confirmed_state)
+        .await?;
+
+    // dbg!(&confirmed_state.coins);
+    // dbg!(&confirmed_state.merkle_tree);
+    // dbg!(&confirmed_state.merkle_tree.root());
+    Ok(())
+}
+
+async fn game_specific_indexing(
+    network_id: NetworkId,
+    db: &Db,
+    indexer_http_url: &Url,
+    client: &reqwest::Client,
+    block_height: u64,
+    tx_hash: TransactionHash,
+    contract_address: String,
+) -> Result<(), anyhow::Error> {
+    let res: serde_json::Value = client
+        .post(indexer_http_url.to_string())
+        .json(&json!({
+            "query": format!(r#"{{
+                            contract(address: "{}", transactionOffset: {{ hash: "{}" }} ) {{
+                                state
+                            }}
+                        }}"#, contract_address, hex::encode(tx_hash.0.0)),
+        }))
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let state_raw = res
+        .get("data")
+        .and_then(|data| data.get("contract"))
+        .and_then(|contract| contract.get("state"))
+        .and_then(|state| state.as_str())
+        .ok_or(anyhow::anyhow!(
+            "Unexpected format for contract state query {}",
+            res.to_string()
+        ))?;
+
+    let state_raw = hex::decode(state_raw).context(anyhow::anyhow!(
+        "Expected hex string for the contract statestate"
+    ))?;
+
+    let state: ContractState<InMemoryDB> =
+        deserialize(std::io::Cursor::new(state_raw), network_id)?;
+    let mut flattened_entries = vec![];
+    match &state.data {
+        StateValue::Array(arr) => {
+            for entry in arr.iter() {
+                match &*entry {
+                    StateValue::Array(arr) => {
+                        for entry in arr.iter() {
+                            flattened_entries.push(entry.as_cell().unwrap())
+                        }
+                    }
+                    StateValue::Cell(cell) => {
+                        flattened_entries.push(Arc::clone(cell));
+                    }
+                    _ => todo!(),
+                }
+            }
+        }
+        _ => todo!(),
+    }
+    let mapped_entries = flattened_entries
+        .clone()
+        .into_iter()
+        .rev()
+        .take(3)
+        .rev()
+        .map(|state_var| {
+            let mut joined = state_var
+                .value
+                .0
+                .iter()
+                .zip(state_var.alignment.0.iter())
+                .map(|(value, alignment)| match &alignment {
+                    AlignmentSegment::Atom(atom) => match &atom {
+                        AlignmentAtom::Compress => "".to_string(),
+                        AlignmentAtom::Bytes { length } => {
+                            let mut s = hex::encode(&value.0);
+
+                            if let Some(missing_zeroes) =
+                                (*length as usize).checked_sub(value.0.len())
+                            {
+                                s.extend(std::iter::repeat_n('0', missing_zeroes * 2));
+                            }
+
+                            s
+                        }
+                        AlignmentAtom::Field => hex::encode(&value.0),
+                    },
+                    _ => todo!(),
+                })
+                .fold(String::new(), |mut s, v| {
+                    s.push_str(&v);
+                    s.push(';');
+                    s
+                });
+
+            joined.pop();
+
+            joined
+        })
+        .collect::<Vec<_>>();
+    db.update_contract_state(
+        &contract_address,
+        &mapped_entries[0],
+        &mapped_entries[1],
+        &mapped_entries[2],
+        block_height,
+    )
+    .await?;
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct SessionId(pub String);
+
+impl SessionId {
+    pub async fn disconnect(
+        self,
+        indexer_http_url: &Url,
+        client: &reqwest::Client,
+    ) -> anyhow::Result<()> {
+        let connect_query = format!(
+            r#"mutation {{
+        disconnect(sessionId: "{}")
+    }}"#,
+            self.0
+        );
+
+        client
+            .post(indexer_http_url.to_string())
+            .json(&json!({
+                "query": connect_query,
+            }))
+            .send()
+            .await?;
+
+        Ok(())
+    }
+}
+
+async fn connect_wallet_to_indexer(
+    indexer_http_url: &Url,
+    secret_keys: &SecretKeys,
+    client: &reqwest::Client,
+) -> Result<SessionId, anyhow::Error> {
+    let mut buffer = vec![];
+    <_ as Serializable>::serialize(&secret_keys.encryption_secret_key, &mut buffer).unwrap();
+    let bech32_viewing_key = bech32::encode::<bech32::Bech32>(
+        bech32::Hrp::parse("mn_shield-esk_undeployed").unwrap(),
+        &buffer,
+    )
+    .unwrap();
+    let connect_query = format!(
+        r#"mutation {{
+        connect(viewingKey: "{}")
+    }}"#,
+        bech32_viewing_key
+    );
+
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct Data {
+        data: Connect,
+    }
+
+    #[derive(Deserialize)]
+    struct Connect {
+        connect: String,
+    }
+    let res: Data = client
+        .post(indexer_http_url.to_string())
+        .json(&json!({
+            "query": connect_query,
+        }))
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    Ok(SessionId(res.data.connect))
 }

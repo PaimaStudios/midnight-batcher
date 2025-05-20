@@ -1,29 +1,31 @@
 use crate::{
-    balancing::{balance_and_submit_tx, ProvingParams},
-    db::Db,
-    preproofing::PreProvingServiceChannelTx,
-    whitelisting, SyncStatus,
+    balancing::balance_and_submit_tx, db::Db, preproofing::PreProvingServiceChannelTx,
+    sync_status::SharedSyncStatus, whitelisting, SyncStatus,
 };
-use midnight_zswap::serialize::{self, NetworkId};
+use midnight_zswap::{
+    keys::SecretKeys,
+    serialize::{self, NetworkId},
+    storage::db::InMemoryDB,
+};
 use rand::{rngs::OsRng, Rng};
 use rocket::{http::Method, serde::json::Json, State};
 use rocket_cors::{AllowedOrigins, CorsOptions};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use subxt::{OnlineClient, SubstrateConfig};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tracing::Instrument as _;
 
 struct AppState {
-    proving_params: Arc<ProvingParams>,
-    zswap_state: Arc<Mutex<midnight_zswap::local::State>>,
+    zswap_state: Arc<Mutex<midnight_zswap::local::State<InMemoryDB>>>,
     network_id: NetworkId,
-    sync_status: Arc<RwLock<SyncStatus>>,
+    sync_status: SharedSyncStatus,
     api: OnlineClient<SubstrateConfig>,
     inputs_service: PreProvingServiceChannelTx,
     whitelisting: Arc<Option<whitelisting::Constraints>>,
     db: Db,
     address: String,
+    secret_keys: SecretKeys,
 }
 
 #[derive(Deserialize)]
@@ -86,7 +88,7 @@ impl From<anyhow::Error> for Error {
 }
 
 async fn check_is_wallet_in_sync(state: &AppState) -> Result<(), Error> {
-    let sync_status = state.sync_status.read().await;
+    let sync_status = state.sync_status.inner.read().await;
 
     match *sync_status {
         SyncStatus::Syncing {
@@ -117,7 +119,6 @@ async fn submit_tx(
     let now = std::time::Instant::now();
 
     let (tx_hash, identifiers) = balance_and_submit_tx(
-        Arc::clone(&state.proving_params),
         &state.api,
         Arc::clone(&state.zswap_state),
         &transaction.tx,
@@ -125,6 +126,7 @@ async fn submit_tx(
         state.inputs_service.clone(),
         &state.whitelisting,
         &state.db,
+        &state.secret_keys,
     )
     .instrument(span.clone())
     .await?;
@@ -166,15 +168,7 @@ async fn funds(state: &State<AppState>) -> Result<Json<GetFundsResponse>, Error>
         })
         .collect();
 
-    let sync_status = state.sync_status.read().await;
-
-    let progress = match *sync_status {
-        SyncStatus::Syncing {
-            progress,
-            notify: _,
-        } => progress,
-        SyncStatus::UpToDate => 100.0,
-    };
+    let progress = state.sync_status.current_progress().await;
 
     Ok(Json(GetFundsResponse {
         coins,
@@ -331,18 +325,17 @@ async fn get_player_achievements(
 
 #[allow(clippy::too_many_arguments)]
 pub fn rocket(
-    prover_params: Arc<ProvingParams>,
     api: OnlineClient<SubstrateConfig>,
-    zswap_state: Arc<Mutex<midnight_zswap::local::State>>,
+    zswap_state: Arc<Mutex<midnight_zswap::local::State<InMemoryDB>>>,
     network_id: NetworkId,
-    sync_status: Arc<RwLock<SyncStatus>>,
+    sync_status: SharedSyncStatus,
     inputs_service: PreProvingServiceChannelTx,
     whitelisting: Option<whitelisting::Constraints>,
     db: Db,
     address: String,
+    secret_keys: SecretKeys,
 ) -> rocket::Rocket<rocket::Build> {
     let state = AppState {
-        proving_params: prover_params,
         api,
         zswap_state,
         network_id,
@@ -351,6 +344,7 @@ pub fn rocket(
         whitelisting: Arc::new(whitelisting),
         db,
         address,
+        secret_keys,
     };
 
     let cors = CorsOptions::default()

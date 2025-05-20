@@ -2,10 +2,13 @@ use crate::db::Db;
 use anyhow::Context as _;
 use midnight_ledger::{
     onchain_runtime::state::EntryPointBuf,
-    structure::{ContractAction, Transaction},
+    structure::{ContractAction, Proof, Transaction},
 };
-use midnight_transient_crypto::proofs::{Proof, VerifierKey};
-use midnight_zswap::serialize::{deserialize, serialize, NetworkId};
+use midnight_transient_crypto::proofs::VerifierKey;
+use midnight_zswap::{
+    serialize::{deserialize, serialize, NetworkId},
+    storage::db::InMemoryDB,
+};
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 pub type Constraints = Arc<HashMap<EntryPointBuf, VerifierKey>>;
@@ -47,7 +50,7 @@ pub fn read_constraints(
 
 pub async fn check_call(
     db: &Db,
-    tx: &Transaction<Proof>,
+    tx: &Transaction<Proof, InMemoryDB>,
     network_id: NetworkId,
 ) -> anyhow::Result<Option<String>> {
     let tx = match tx {
@@ -82,7 +85,7 @@ pub async fn check_call(
 
 pub fn check_deploy(
     constraints: &Constraints,
-    tx: &Transaction<Proof>,
+    tx: &Transaction<Proof, InMemoryDB>,
     network_id: NetworkId,
 ) -> anyhow::Result<Option<String>> {
     let tx = match tx {
@@ -111,12 +114,12 @@ pub fn check_deploy(
     for op in deploy.initial_state.operations.iter() {
         let op_s = String::from_utf8_lossy(&op.0 .0);
 
-        let Some(vk_c) = constraints.get(&op.0) else {
+        let Some(vk_c) = constraints.get(&*op.0) else {
             tracing::debug!(op = %op_s, "vk not found");
             return Ok(None);
         };
 
-        let Some(vk_d) = &op.1.v1 else {
+        let Some(vk_d) = &op.1.v2 else {
             return Ok(None);
         };
 

@@ -156,7 +156,8 @@ async fn main() -> anyhow::Result<()> {
 
     let client = reqwest::Client::new();
 
-    let session_id = connect_wallet_to_indexer(&indexer_http_url, &secret_keys, &client).await?;
+    let session_id =
+        connect_wallet_to_indexer(&indexer_http_url, &secret_keys, &client, network_id).await?;
 
     let indexer_task_handle = {
         let initial_state = Arc::clone(&initial_state);
@@ -440,16 +441,21 @@ async fn process_collapsed_update(
 ) -> Result<(), anyhow::Error> {
     let collapsed_update_raw = hex::decode(collapsed_update.update)
         .context("expected raw collapsed update to be in hex")?;
+
     let collapsed_update = deserialize::<
         midnight_transient_crypto::merkle_tree::MerkleTreeCollapsedUpdate,
         _,
     >(std::io::Cursor::new(collapsed_update_raw), network_id)
     .context("Collapsed update can't be deserialized")?;
+
     *confirmed_state = confirmed_state.apply_collapsed_update(&collapsed_update)?;
     let mut unconfirmed_state_guard = latest_state.lock().await;
+
     *unconfirmed_state_guard = unconfirmed_state_guard.apply_collapsed_update(&collapsed_update)?;
+
     db.persist_state(STABLE_STATE_ID, collapsed_update.start, &*confirmed_state)
         .await?;
+
     Ok(())
 }
 
@@ -685,14 +691,27 @@ async fn connect_wallet_to_indexer(
     indexer_http_url: &Url,
     secret_keys: &SecretKeys,
     client: &reqwest::Client,
+    network_id: NetworkId,
 ) -> Result<SessionId, anyhow::Error> {
     let mut buffer = vec![];
-    <_ as Serializable>::serialize(&secret_keys.encryption_secret_key, &mut buffer).unwrap();
+    // IMPORTANT: this would allow the indexer to know which transactions are ours.
+    <_ as Serializable>::serialize(&secret_keys.encryption_secret_key, &mut buffer)
+        .context("Serialization failed on encryption secret key")?;
+
+    let hrp = match network_id {
+        NetworkId::Undeployed => "mn_shield-esk_undeployed",
+        NetworkId::TestNet => "mn_shield-esk_test",
+        NetworkId::MainNet => "mn_shield-esk",
+        NetworkId::DevNet => "mn_shield-esk_dev",
+        _ => anyhow::bail!("unknown network id"),
+    };
+
     let bech32_viewing_key = bech32::encode::<bech32::Bech32>(
-        bech32::Hrp::parse("mn_shield-esk_undeployed").unwrap(),
+        bech32::Hrp::parse(hrp).context("Couldn't parse bech32 HRP")?,
         &buffer,
     )
-    .unwrap();
+    .context("bech32 encoding of viewing key")?;
+
     let connect_query = format!(
         r#"mutation {{
         connect(viewingKey: "{}")

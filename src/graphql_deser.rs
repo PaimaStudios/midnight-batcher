@@ -35,7 +35,7 @@ pub struct RelevantTransaction {
 
 #[derive(Debug, Deserialize)]
 pub struct MerkleTreeCollapsedUpdate {
-    #[serde(rename = "protocolVersion")]
+    // #[serde(rename = "protocolVersion")]
     // pub protocol_version: u64,
     // pub start: u64,
     // pub end: u64,

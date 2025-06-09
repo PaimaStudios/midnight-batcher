@@ -6,156 +6,35 @@ use crate::{
     utils::OnDrop,
     whitelisting::{self, check_call, check_deploy},
 };
-use anyhow::Context as _;
-use midnight_ledger::structure::{Transaction, DUMMY_PARAMETERS};
-use midnight_transient_crypto::proofs::{IrSource, ParamsProver, Proof, ProverKey, VerifierKey};
+use midnight_ledger::structure::{Proof, ProofPreimage, Transaction, DUMMY_PARAMETERS};
 use midnight_zswap::{
     coin_structure::{self, coin::NATIVE_TOKEN},
+    keys::SecretKeys,
     local::State,
     serialize::{deserialize, serialize, NetworkId},
+    storage::db::InMemoryDB,
     Offer, Output,
 };
 use rand::{rngs::OsRng, Rng as _};
-use std::{
-    cmp::Reverse,
-    fs::File,
-    io::{BufReader, Cursor},
-    sync::Arc,
-};
+use std::{cmp::Reverse, sync::Arc};
 use subxt::{OnlineClient, SubstrateConfig};
 use tokio::sync::Mutex;
 
-const OUTPUT_VK_RAW: &str = concat!(
-    env!("MIDNIGHT_LEDGER_STATIC_DIR"),
-    "/zswap/keys/output.verifier"
-);
-
-const OUTPUT_PK_RAW: &str = concat!(
-    env!("MIDNIGHT_LEDGER_STATIC_DIR"),
-    "/zswap/keys/output.prover"
-);
-
-const OUTPUT_IR_RAW: &str = concat!(
-    env!("MIDNIGHT_LEDGER_STATIC_DIR"),
-    "/zswap/zkir/output.zkir"
-);
-
-const SPEND_VK_RAW: &str = concat!(
-    env!("MIDNIGHT_LEDGER_STATIC_DIR"),
-    "/zswap/keys/spend.verifier"
-);
-
-const SPEND_PK_RAW: &str = concat!(
-    env!("MIDNIGHT_LEDGER_STATIC_DIR"),
-    "/zswap/keys/spend.prover"
-);
-
-const SPEND_IR_RAW: &str = concat!(env!("MIDNIGHT_LEDGER_STATIC_DIR"), "/zswap/zkir/spend.zkir");
-
-const SIGN_VK_RAW: &str = concat!(
-    env!("MIDNIGHT_LEDGER_STATIC_DIR"),
-    "/zswap/keys/sign.verifier"
-);
-
-const SIGN_PK_RAW: &str = concat!(
-    env!("MIDNIGHT_LEDGER_STATIC_DIR"),
-    "/zswap/keys/sign.prover"
-);
-
-const SIGN_IR_RAW: &str = concat!(env!("MIDNIGHT_LEDGER_STATIC_DIR"), "/zswap/zkir/sign.zkir");
-
-pub fn decode_zswap_proof_params(
-    pk: Vec<u8>,
-    vk: Vec<u8>,
-    ir: Vec<u8>,
-) -> anyhow::Result<(ProverKey, VerifierKey, IrSource)> {
-    let pk = deserialize::<ProverKey, _>(Cursor::new(pk), NetworkId::TestNet)
-        .context("Failed to read proving key")?;
-    let vk = deserialize::<VerifierKey, _>(Cursor::new(vk), NetworkId::TestNet)
-        .context("Failed to read verifying key")?;
-    let ir = IrSource::load(Cursor::new(ir)).context("Failed to read ZKIR source")?;
-
-    Ok((pk, vk, ir))
-}
-
-pub fn read_kzg_params() -> anyhow::Result<ParamsProver> {
-    let pp = std::env::var("MIDNIGHT_LEDGER_STATIC_DIR")
-        .context("MIDNIGHT_LEDGER_STATIC_DIR not set")?
-        + "/kzg";
-
-    ParamsProver::read(BufReader::new(
-        File::open(pp).expect("failed to read kzg params"),
-    ))
-    .context("Failed to read KZG params")
-}
-
-pub struct ProvingParams {
-    pub pp: ParamsProver,
-    pub spend: (ProverKey, VerifierKey, IrSource),
-    pub output: (ProverKey, VerifierKey, IrSource),
-    pub sign: (ProverKey, VerifierKey, IrSource),
-}
-
-impl ProvingParams {
-    pub fn new() -> anyhow::Result<Self> {
-        // we only need to prove spend, output and sign, so we can downsize this
-        // to the minimum of those.
-        let min_k = 15;
-        let pp = read_kzg_params()?.downsize(min_k);
-
-        fn read_proof_params(path: &str) -> anyhow::Result<Vec<u8>> {
-            std::fs::read(std::path::Path::new(path))
-                .context(format!("Failed to read from {} into memory", path))
-        }
-
-        let spend = decode_zswap_proof_params(
-            read_proof_params(SPEND_PK_RAW)?,
-            read_proof_params(SPEND_VK_RAW)?,
-            read_proof_params(SPEND_IR_RAW)?,
-        )?;
-
-        // info!("spend k: {}", spend.2.model(None).k());
-
-        let output = decode_zswap_proof_params(
-            read_proof_params(OUTPUT_PK_RAW)?,
-            read_proof_params(OUTPUT_VK_RAW)?,
-            read_proof_params(OUTPUT_IR_RAW)?,
-        )?;
-
-        // info!("output k: {}", output.2.model(None).k());
-
-        let sign = decode_zswap_proof_params(
-            read_proof_params(SIGN_PK_RAW)?,
-            read_proof_params(SIGN_VK_RAW)?,
-            read_proof_params(SIGN_IR_RAW)?,
-        )?;
-
-        // info!("sign k: {}", output.2.model(None).k());
-
-        Ok(ProvingParams {
-            pp,
-            spend,
-            output,
-            sign,
-        })
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn balance_and_submit_tx(
-    prover_params: Arc<ProvingParams>,
     api: &OnlineClient<SubstrateConfig>,
-    base_state: Arc<Mutex<State>>,
+    base_state: Arc<Mutex<State<InMemoryDB>>>,
     tx: &str,
     network_id: NetworkId,
     inputs_service: PreProvingServiceChannelTx,
     whitelisting: &Option<whitelisting::Constraints>,
     db: &Db,
+    secret_keys: &SecretKeys,
 ) -> Result<(String, Vec<String>), Error> {
     // TODO: we should fetch this from the ledger state, but this works right now anyway.
     let parameters = DUMMY_PARAMETERS;
 
-    let unbalanced_tx: Transaction<Proof> =
+    let unbalanced_tx: Transaction<Proof, InMemoryDB> =
         deserialize(
             std::io::Cursor::new(hex::decode(tx).map_err(|_| {
                 Error::BadRequest("Transaction payload is not valid hex".to_string())
@@ -185,7 +64,7 @@ pub async fn balance_and_submit_tx(
     // TODO: this probably only works for a single input and a single output.
     //
     // figure out how to generalize
-    let zswap_cost_estimation = 40000;
+    let zswap_cost_estimation = 40500;
     let cost = unbalanced_tx
         .cost(&parameters)
         .map_err(|e| Error::InternalError(e.to_string()))?;
@@ -226,16 +105,18 @@ pub async fn balance_and_submit_tx(
 
     let mut inputs = vec![];
     for coin in to_spend {
+        // TODO: what does this mean?
+        let segment = 0;
         let (new_state, input) = state_guard
-            .spend(&mut OsRng, &coin.1)
+            .spend(&mut OsRng, secret_keys, &coin.1, segment)
             .map_err(|e| Error::InternalError(e.to_string()))?;
 
         *state_guard = new_state;
         inputs.push(input);
     }
 
-    let coin_public_key = state_guard.coin_public_key();
-    let enc_public_key = state_guard.enc_public_key();
+    let coin_public_key = secret_keys.coin_public_key();
+    let enc_public_key = secret_keys.enc_public_key();
 
     std::mem::drop(state_guard);
 
@@ -277,7 +158,6 @@ pub async fn balance_and_submit_tx(
         inputs_tx.clone(),
         curr_balance,
         fees,
-        Arc::clone(&prover_params),
         PublicKeys {
             coin_public_key,
             enc_public_key,
@@ -300,17 +180,18 @@ struct PublicKeys {
 
 #[allow(clippy::too_many_arguments)]
 async fn prove_and_submit(
-    inputs_tx: Transaction<Proof>,
+    inputs_tx: Transaction<Proof, InMemoryDB>,
     curr_balance: u128,
     fees: u128,
-    prover_params: Arc<ProvingParams>,
     public_keys: PublicKeys,
-    unbalanced_tx: Transaction<Proof>,
+    unbalanced_tx: Transaction<Proof, InMemoryDB>,
     network_id: NetworkId,
     api: &OnlineClient<SubstrateConfig>,
 ) -> Result<(String, Vec<String>), Error> {
     let value = curr_balance - fees;
 
+    // TODO: what's this for?
+    let segment = 0;
     let outputs_offer_tx = Offer {
         inputs: vec![],
         outputs: vec![Output::new(
@@ -320,6 +201,7 @@ async fn prove_and_submit(
                 type_: NATIVE_TOKEN,
                 value,
             },
+            segment,
             &public_keys.coin_public_key,
             Some(public_keys.enc_public_key),
         )
@@ -328,11 +210,12 @@ async fn prove_and_submit(
         deltas: vec![(NATIVE_TOKEN, fees as i128)],
     };
 
-    let outputs_tx = Transaction::new(outputs_offer_tx, None, None);
+    let outputs_tx: Transaction<ProofPreimage, InMemoryDB> =
+        Transaction::new(outputs_offer_tx, None, None);
 
     let instant = std::time::Instant::now();
 
-    let outputs_tx = prove_tx_in_rayon_pool(&prover_params, outputs_tx).await;
+    let outputs_tx = prove_tx_in_rayon_pool(outputs_tx).await;
 
     tracing::info!(
         "proved outputs zswap in {} ms",
@@ -387,8 +270,6 @@ async fn prove_and_submit(
         .submit_and_watch()
         .await
         .map_err(|e| Error::InternalError(e.to_string()))?;
-
-    tracing::info!(tx_hash, "submitting transaction");
 
     let now = std::time::Instant::now();
 

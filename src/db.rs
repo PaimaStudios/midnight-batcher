@@ -3,6 +3,7 @@ use deadpool_sqlite::{Config, Pool, Runtime};
 use midnight_zswap::{
     local::State,
     serialize::{deserialize, serialize, NetworkId},
+    storage::db::InMemoryDB,
 };
 use rusqlite::OptionalExtension as _;
 use std::path::Path;
@@ -27,19 +28,23 @@ impl Db {
         Ok(res)
     }
 
-    pub async fn persist_state(&self, id: &str, hash: &str, state: &State) -> anyhow::Result<()> {
+    pub async fn persist_state(
+        &self,
+        id: &str,
+        start_index: u64,
+        state: &State<InMemoryDB>,
+    ) -> anyhow::Result<()> {
         let mut buf = vec![];
         serialize(&state, &mut buf, self.network_id)?;
 
         let conn = self.pool.get().await.unwrap();
 
         let id = id.to_string();
-        let hash = hash.to_string();
 
         conn.interact(move |conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO state (id, hash, state) VALUES (?1, ?2, ?3)",
-                (&id, &hash, &buf),
+                "INSERT OR REPLACE INTO state (id, start_index, state) VALUES (?1, ?2, ?3)",
+                (&id, &start_index, &buf),
             )
         })
         .await
@@ -49,20 +54,44 @@ impl Db {
         Ok(())
     }
 
-    pub async fn get_state(&self, id: &str) -> anyhow::Result<Option<(String, State)>> {
+    pub async fn get_last_known_tx_index(&self, id: &str) -> anyhow::Result<Option<u64>> {
         let conn = self.pool.get().await.unwrap();
 
         let id = id.to_string();
 
         let row = conn
-            .interact(move |conn| -> anyhow::Result<Option<(String, Vec<u8>)>> {
+            .interact(move |conn| -> anyhow::Result<Option<u64>> {
                 let mut stmt = conn.prepare(
-                    "SELECT hash, state FROM state WHERE id = ?1 ORDER BY rowid DESC LIMIT 1",
+                    "SELECT start_index FROM state WHERE id = ?1 ORDER BY rowid DESC LIMIT 1",
+                )?;
+
+                let row = stmt
+                    .query_row([id], |row| Ok(row.get::<_, u64>(0)?))
+                    .optional()
+                    .context("Database access error")?;
+
+                Ok(row)
+            })
+            .await
+            .unwrap()?;
+
+        Ok(row)
+    }
+
+    pub async fn get_state(&self, id: &str) -> anyhow::Result<Option<(u64, State<InMemoryDB>)>> {
+        let conn = self.pool.get().await.unwrap();
+
+        let id = id.to_string();
+
+        let row = conn
+            .interact(move |conn| -> anyhow::Result<Option<(u64, Vec<u8>)>> {
+                let mut stmt = conn.prepare(
+                    "SELECT start_index, state FROM state WHERE id = ?1 ORDER BY rowid DESC LIMIT 1",
                 )?;
 
                 let row = stmt
                     .query_row([id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                        Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
                     })
                     .optional()
                     .context("Database access error")?;
@@ -72,11 +101,11 @@ impl Db {
             .await
             .unwrap()?;
 
-        if let Some((hash, unserialized_state)) = row {
+        if let Some((start_index, unserialized_state)) = row {
             let state = deserialize(std::io::Cursor::new(unserialized_state), self.network_id)
                 .context("Can't deserialize state object")?;
 
-            Ok(Some((hash, state)))
+            Ok(Some((start_index, state)))
         } else {
             Ok(None)
         }
@@ -248,7 +277,7 @@ impl Db {
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS state (
                 id TEXT PRIMARY KEY,
-                hash TEXT NOT NULL,
+                start_index INTEGER NOT NULL,
                 state BLOB NOT NULL
             )",
                 (),

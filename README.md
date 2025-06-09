@@ -18,15 +18,12 @@ cd ./local-chain-setup
 source .envrc
 npm install
 docker compose up
-# in another terminal
-npm run fund-batcher
 ```
 
 2. Run the batcher.
 
 ```sh
 cd ./local-chain-setup
-source .envrc
 cargo run --release
 ```
 

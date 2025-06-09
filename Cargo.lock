@@ -2598,7 +2598,6 @@ dependencies = [
  "subxt-signer",
  "tokio",
  "tokio-tungstenite",
- "toml_edit",
  "tracing",
  "tracing-subscriber",
  "url",

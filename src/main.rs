@@ -573,7 +573,7 @@ async fn process_transaction(
 
     signal.notify_waiters();
 
-    db.persist_state(STABLE_STATE_ID, update.start, confirmed_state)
+    db.persist_state(STABLE_STATE_ID, update.end, confirmed_state)
         .await?;
 
     // dbg!(&confirmed_state.coins);

@@ -24,7 +24,8 @@ struct AppState {
     inputs_service: PreProvingServiceChannelTx,
     whitelisting: Arc<Option<whitelisting::Constraints>>,
     db: Db,
-    address: String,
+    legacy_address: String,
+    bech32_address: String,
     secret_keys: SecretKeys,
 }
 
@@ -179,7 +180,15 @@ async fn funds(state: &State<AppState>) -> Result<Json<GetFundsResponse>, Error>
 
 #[get("/address")]
 async fn address(state: &State<AppState>) -> String {
-    state.address.clone()
+    // the provider on the game's side is instantiated with both keys from this
+    // endpoint, so keeping this around for now, but eventually this should be
+    // replaced with the bech32 format.
+    state.legacy_address.clone()
+}
+
+#[get("/address/bech32")]
+async fn bech32_address(state: &State<AppState>) -> String {
+    state.bech32_address.clone()
 }
 
 #[get("/lobbies/open?<after>&<count>&<exclude_player>")]
@@ -332,7 +341,7 @@ pub fn rocket(
     inputs_service: PreProvingServiceChannelTx,
     whitelisting: Option<whitelisting::Constraints>,
     db: Db,
-    address: String,
+    addresses: (String, String),
     secret_keys: SecretKeys,
 ) -> rocket::Rocket<rocket::Build> {
     let state = AppState {
@@ -343,7 +352,8 @@ pub fn rocket(
         inputs_service,
         whitelisting: Arc::new(whitelisting),
         db,
-        address,
+        legacy_address: addresses.0,
+        bech32_address: addresses.1,
         secret_keys,
     };
 
@@ -365,6 +375,7 @@ pub fn rocket(
                 submit_tx,
                 funds,
                 address,
+                bech32_address,
                 get_open_lobbies,
                 get_player_lobbies,
                 get_public_achievements,

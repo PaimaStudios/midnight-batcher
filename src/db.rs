@@ -54,6 +54,30 @@ impl Db {
         Ok(())
     }
 
+    pub async fn get_last_known_tx_index(&self, id: &str) -> anyhow::Result<Option<u64>> {
+        let conn = self.pool.get().await.unwrap();
+
+        let id = id.to_string();
+
+        let row = conn
+            .interact(move |conn| -> anyhow::Result<Option<u64>> {
+                let mut stmt = conn.prepare(
+                    "SELECT start_index FROM state WHERE id = ?1 ORDER BY rowid DESC LIMIT 1",
+                )?;
+
+                let row = stmt
+                    .query_row([id], |row| Ok(row.get::<_, u64>(0)?))
+                    .optional()
+                    .context("Database access error")?;
+
+                Ok(row)
+            })
+            .await
+            .unwrap()?;
+
+        Ok(row)
+    }
+
     pub async fn get_state(&self, id: &str) -> anyhow::Result<Option<(u64, State<InMemoryDB>)>> {
         let conn = self.pool.get().await.unwrap();
 

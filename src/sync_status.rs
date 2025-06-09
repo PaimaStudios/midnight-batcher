@@ -22,11 +22,19 @@ impl SharedSyncStatus {
         }
     }
 
-    pub async fn update(&self, progress_update: graphql_deser::ProgressUpdate) {
+    pub async fn update(
+        &self,
+        progress_update: graphql_deser::ProgressUpdate,
+        highest_known_index: u64,
+    ) {
         let mut sync_status = self.inner.write().await;
 
-        let sync_percent = progress_update.highest_relevant_wallet_index as f64
-            / progress_update.highest_index as f64;
+        let mut sync_percent =
+            highest_known_index as f64 / progress_update.highest_relevant_wallet_index as f64;
+
+        if progress_update.highest_relevant_wallet_index == 0 {
+            sync_percent = 1.0;
+        }
 
         if sync_percent > 0.95 {
             if let SyncStatus::Syncing {
@@ -41,8 +49,8 @@ impl SharedSyncStatus {
         } else {
             tracing::info!(
                 "progress update: {}/{}",
-                progress_update.highest_relevant_wallet_index,
-                progress_update.highest_index
+                highest_known_index,
+                progress_update.highest_relevant_wallet_index
             );
             let notify = if let SyncStatus::Syncing {
                 progress: _,

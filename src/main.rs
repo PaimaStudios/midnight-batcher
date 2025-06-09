@@ -45,7 +45,7 @@ const NODE_LOCALHOST: &str = "ws://127.0.0.1:9944";
 #[subxt::subxt(runtime_metadata_path = "metadata.scale")]
 pub mod midnight {}
 
-fn address(zswap_state: &SecretKeys) -> String {
+fn legacy_address(zswap_state: &SecretKeys) -> String {
     let pk = zswap_state.coin_public_key();
     let epk = zswap_state.enc_public_key();
 
@@ -57,6 +57,28 @@ fn address(zswap_state: &SecretKeys) -> String {
     let ec_hex = hex::encode(&buf);
 
     format!("{}|{}", pk_hex, ec_hex)
+}
+
+fn bech32_address(secret_keys: &SecretKeys, network_id: NetworkId) -> anyhow::Result<String> {
+    let hrp = match network_id {
+        NetworkId::Undeployed => "mn_shield-addr_undeployed",
+        NetworkId::TestNet => "mn_shield-addr_test",
+        NetworkId::MainNet => "mn_shield-addr",
+        NetworkId::DevNet => "mn_shield-addr_dev",
+        _ => anyhow::bail!("unknown network id"),
+    };
+
+    let mut buffer = vec![];
+    <_ as Serializable>::serialize(&secret_keys.coin_public_key(), &mut buffer)
+        .context("Serialization failed on encryption secret key")?;
+    <_ as Serializable>::serialize(&secret_keys.enc_public_key(), &mut buffer)
+        .context("Serialization failed on encryption secret key")?;
+
+    bech32::encode::<bech32::Bech32m>(
+        bech32::Hrp::parse(hrp).context("Couldn't parse bech32 HRP")?,
+        &buffer,
+    )
+    .context("bech32 encoding of viewing key")
 }
 
 #[rocket::main]
@@ -141,9 +163,13 @@ async fn main() -> anyhow::Result<()> {
         .map(|(_, state)| state.clone())
         .unwrap_or_else(State::new);
 
-    let address = address(&secret_keys);
+    let legacy_address = legacy_address(&secret_keys);
 
-    info!("Batcher address {}", address);
+    info!("Legacy address {}", legacy_address);
+
+    let bech32_address = bech32_address(&secret_keys, network_id)?;
+
+    info!("Bech32 address {}", bech32_address);
 
     let sync_status = sync_status::SharedSyncStatus::new(SyncStatus::Syncing {
         progress: 0.0,
@@ -227,7 +253,7 @@ async fn main() -> anyhow::Result<()> {
             pre_proving_comm_tx,
             whitelisting,
             db,
-            address,
+            (legacy_address, bech32_address),
             secret_keys.clone(),
         )
         .launch()
@@ -384,7 +410,14 @@ async fn wallet_indexer(
                 let updates = match val.payload.data.wallet {
                     graphql_deser::TransactionOrUpdate::ViewingUpdate(tx_added) => tx_added.update,
                     graphql_deser::TransactionOrUpdate::ProgressUpdate(pu) => {
-                        sync_status.update(pu).await;
+                        sync_status
+                            .update(
+                                pu,
+                                db.get_last_known_tx_index(STABLE_STATE_ID)
+                                    .await?
+                                    .unwrap_or(0),
+                            )
+                            .await;
                         continue;
                     }
                 };

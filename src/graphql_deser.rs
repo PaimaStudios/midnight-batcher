@@ -53,10 +53,12 @@ pub struct Transaction {
 
 #[derive(Debug, Deserialize)]
 pub struct ProgressUpdate {
+    #[allow(unused)]
     #[serde(rename = "highestIndex")]
     pub highest_index: u64,
-    // #[serde(rename = "highestRelevantIndex")]
-    // pub highest_relevant_index: u64,
+    #[allow(unused)]
+    #[serde(rename = "highestRelevantIndex")]
+    pub highest_relevant_index: u64,
     #[serde(rename = "highestRelevantWalletIndex")]
     pub highest_relevant_wallet_index: u64,
 }

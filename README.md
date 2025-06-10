@@ -1,13 +1,23 @@
 ## Building
 
-```
+
+```sh
 git clone ...
 git submodule update --init --recursive
 ```
 
-The build.rs file does modify the submodule in order to use only path
-dependencies. This is done to avoid running into compilation issues with
-duplicated git dependencies.
+Then (only once)
+
+```sh
+pip install toml # or any preferred of getting the dependency
+python scripts/patch-midnight-ledger-prototype-with-local-deps.py
+```
+
+The script modifies the `Cargo.toml` files inside the submodule so that
+they use local paths to the other dependencies in there, instead of using
+url dependencies to the same monorepo. This is done to avoid running into
+compilation issues with duplicated git dependencies, and it also makes patching
+easier.
 
 ## Local chain usage
 

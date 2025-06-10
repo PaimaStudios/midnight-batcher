@@ -5,7 +5,7 @@ import toml
 import pathlib
 
 def main():
-    files = [
+    files = (
         "zkir",
         "base-crypto",
         "coin-structure",
@@ -16,7 +16,7 @@ def main():
         "storage",
         "transient-crypto",
         "zswap",
-    ]
+    )
 
     for file in files:
         file_path = pathlib.Path(f"./midnight-ledger-prototype/{file}/Cargo.toml")
@@ -36,7 +36,7 @@ def main():
             toml.dump(doc, f)
 
 def replace_midnight_dep_with_local(deps):
-    for key, val in list(deps.items()):
+    for key, val in deps.items():
         if isinstance(val, dict):
             if "git" in val and val.get("git", "").startswith("https://github.com/input-output-hk/midnight-ledger-prototype"):
                 val.pop("git", None)

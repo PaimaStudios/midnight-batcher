@@ -595,7 +595,7 @@ async fn game_specific_indexing(
         .post(indexer_http_url.to_string())
         .json(&json!({
             "query": format!(r#"{{
-                            contract(address: "{}", transactionOffset: {{ hash: "{}" }} ) {{
+                            contractAction(address: "{}", offset: {{ transactionOffset: {{ hash: "{}" }} }} ) {{
                                 state
                             }}
                         }}"#, contract_address, hex::encode(tx_hash.0.0)),
@@ -607,7 +607,7 @@ async fn game_specific_indexing(
 
     let state_raw = res
         .get("data")
-        .and_then(|data| data.get("contract"))
+        .and_then(|data| data.get("contractAction"))
         .and_then(|contract| contract.get("state"))
         .and_then(|state| state.as_str())
         .ok_or(anyhow::anyhow!(

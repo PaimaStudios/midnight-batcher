@@ -95,20 +95,25 @@ pub async fn pre_proving_service(
         // remove old proofs
         proven_guard.retain(|nul, _| state.coins.contains_key(nul));
 
-        let mut unspent_coins = state
+        let mut unproven_coins = state
             .coins
             .iter()
             .filter(|(_, coin)| coin.type_ == NATIVE_TOKEN)
             .filter(|coin| {
-                !state.pending_spends.contains_key(&coin.0) && !proven_guard.contains_key(&coin.0)
+                proven_guard
+                    .get(&coin.0)
+                    .map(|proof_or_notifier| {
+                        matches!(proof_or_notifier, ProofOrNotifier::Waiting(_))
+                    })
+                    .unwrap_or(true)
             })
             .collect::<Vec<_>>();
 
         std::mem::drop(proven_guard);
 
-        unspent_coins.sort_by_key(|(_, coin)| Reverse(coin.value));
+        unproven_coins.sort_by_key(|(_, coin)| Reverse(coin.value));
 
-        for coin in unspent_coins {
+        for coin in unproven_coins {
             // TODO: what does this do?
             let segment = 0;
             let (new_state, input) = state

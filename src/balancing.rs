@@ -16,7 +16,7 @@ use midnight_zswap::{
     Offer, Output,
 };
 use rand::{rngs::OsRng, Rng as _};
-use std::{cmp::Reverse, sync::Arc};
+use std::{cmp::Reverse, sync::Arc, time::Duration};
 use subxt::{OnlineClient, SubstrateConfig};
 use tokio::sync::Mutex;
 
@@ -145,7 +145,15 @@ pub async fn balance_and_submit_tx(
         .await
         .map_err(|e| Error::InternalError(e.to_string()))?;
 
-    let proven_inputs = inputs_rx.await.unwrap();
+    let proven_inputs = tokio::time::timeout(Duration::from_secs(30), inputs_rx)
+        .await
+        .map_err(|_e| {
+            Error::InternalError(
+                "Prover task never produced a proof for the selected input".to_string(),
+            )
+        })?
+        // this one shouldn't really happen, but it's better to be panic free.
+        .map_err(|_e| Error::InternalError("Failed to get prove for selected input".to_string()))?;
 
     let inputs_tx = proven_inputs
         .into_iter()

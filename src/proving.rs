@@ -11,7 +11,7 @@ use mn_ledger::{
 use rand::rngs::OsRng;
 use tokio::{runtime::Handle, sync::OnceCell};
 use transient_crypto::commitment::PedersenRandomness;
-use zswap::{prove::ZswapResolver, ZSWAP_EXPECTED_FILES};
+use zswap::prove::ZswapResolver;
 
 static MIDNIGHT_DATA_PROVIDER: OnceCell<MidnightDataProvider> = OnceCell::const_new();
 
@@ -22,21 +22,27 @@ async fn fetch_proof_params() -> &'static MidnightDataProvider {
             let midnight_data_provider = MidnightDataProvider::new(
                 FetchMode::Synchronous,
                 OutputMode::Log,
-                ZSWAP_EXPECTED_FILES.to_vec(),
+                DUST_EXPECTED_FILES.to_owned(),
             )
             .unwrap();
 
-            for zswap_file in ZSWAP_EXPECTED_FILES {
-                midnight_data_provider.fetch(zswap_file.0).await.unwrap();
-            }
-
             midnight_data_provider
-                .fetch("bls_filecoin_2p15")
+                .fetch("bls_filecoin_2p13")
                 .await
                 .unwrap();
 
             midnight_data_provider
-                .fetch("bls_filecoin_2p14")
+                .fetch("dust/6/spend.prover")
+                .await
+                .unwrap();
+
+            midnight_data_provider
+                .fetch("dust/6/spend.verifier")
+                .await
+                .unwrap();
+
+            midnight_data_provider
+                .fetch("dust/6/spend.bzkir")
                 .await
                 .unwrap();
 
@@ -55,16 +61,12 @@ pub async fn prove_tx_in_rayon_pool(
     {
         tokio::task::spawn_blocking(move || {
             let resolver = Resolver {
-                zswap_resolver: ZswapResolver(midnight_data_provider.clone()),
-                external_resolver: Box::new(|_| unreachable!()),
-                dust_resolver: DustResolver(
-                    MidnightDataProvider::new(
-                        FetchMode::OnDemand,
-                        OutputMode::Log,
-                        DUST_EXPECTED_FILES.to_owned(),
-                    )
-                    .expect("data provider initialization failed"),
+                zswap_resolver: ZswapResolver(
+                    MidnightDataProvider::new(FetchMode::Synchronous, OutputMode::Log, vec![])
+                        .unwrap(),
                 ),
+                external_resolver: Box::new(|_| unreachable!()),
+                dust_resolver: DustResolver(midnight_data_provider),
             };
 
             let tokio_handle = Handle::current();

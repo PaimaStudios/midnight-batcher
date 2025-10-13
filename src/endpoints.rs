@@ -1,32 +1,28 @@
 use crate::{
-    balancing::balance_and_submit_tx, db::Db, preproofing::PreProvingServiceChannelTx,
-    sync_status::SharedSyncStatus, whitelisting, SyncStatus,
+    balancing::balance_and_submit_tx, db::Db, sync_status::SharedSyncStatus,
+    utils::get_current_time, whitelisting, NetworkId, SyncStatus, WalletState,
+    LEDGER_PARAMETERS_DB_ID,
 };
-use midnight_zswap::{
-    keys::SecretKeys,
-    serialize::{self, NetworkId},
-    storage::db::InMemoryDB,
-};
+use midnight_serialize::tagged_serialize;
+use mn_ledger::dust::{DustOutput, DustSecretKey};
 use rand::{rngs::OsRng, Rng};
 use rocket::{http::Method, serde::json::Json, State};
 use rocket_cors::{AllowedOrigins, CorsOptions};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use subxt::{OnlineClient, SubstrateConfig};
-use tokio::sync::Mutex;
 use tracing::Instrument as _;
 
 struct AppState {
-    zswap_state: Arc<Mutex<midnight_zswap::local::State<InMemoryDB>>>,
-    network_id: NetworkId,
+    wallet_state: WalletState,
     sync_status: SharedSyncStatus,
     api: OnlineClient<SubstrateConfig>,
-    inputs_service: PreProvingServiceChannelTx,
     whitelisting: Arc<Option<whitelisting::Constraints>>,
     db: Db,
     legacy_address: String,
     bech32_address: String,
-    secret_keys: SecretKeys,
+    secret_keys: DustSecretKey,
+    network_id: NetworkId,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +78,15 @@ pub enum Error {
     NotAvailable(String),
 }
 
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::BadRequest(message) => write!(f, "Bad Request: {message}"),
+            Error::InternalError(message) => write!(f, "Internal Server Error: {message}"),
+            Error::NotAvailable(message) => write!(f, "Service Unavailable: {message}"),
+        }
+    }
+}
 impl From<anyhow::Error> for Error {
     fn from(value: anyhow::Error) -> Self {
         Self::InternalError(value.to_string())
@@ -97,8 +102,7 @@ async fn check_is_wallet_in_sync(state: &AppState) -> Result<(), Error> {
             notify: _,
         } => {
             return Err(Error::NotAvailable(format!(
-                "Wallet not in sync. Current progress: {}",
-                progress
+                "Wallet not in sync. Current progress: {progress}",
             )))
         }
         SyncStatus::UpToDate => {}
@@ -121,16 +125,19 @@ async fn submit_tx(
 
     let (tx_hash, identifiers) = balance_and_submit_tx(
         &state.api,
-        Arc::clone(&state.zswap_state),
+        state.wallet_state.clone(),
         &transaction.tx,
-        state.network_id,
-        state.inputs_service.clone(),
         &state.whitelisting,
         &state.db,
         &state.secret_keys,
+        &state.network_id,
     )
     .instrument(span.clone())
-    .await?;
+    .await
+    .map_err(|e| {
+        tracing::error!(source=%e, "error in balance and submit");
+        e
+    })?;
 
     span.in_scope(|| {
         tracing::info!(
@@ -147,24 +154,42 @@ async fn submit_tx(
 
 #[get("/funds")]
 async fn funds(state: &State<AppState>) -> Result<Json<GetFundsResponse>, Error> {
-    let lock = state.zswap_state.lock().await;
+    let guard = state.wallet_state.dust_state.lock().await;
+    let pending = state.wallet_state.locked.lock().await;
+    let ledger_parameters = state
+        .db
+        .get_ledger_parameters(LEDGER_PARAMETERS_DB_ID)
+        .await?;
 
-    let coins = lock
-        .coins
-        .iter()
-        .map(|(nul, coin)| {
+    let current_time = get_current_time();
+
+    let coins = guard
+        .utxos()
+        .map(|qdo| {
             let mut buf = vec![];
-            serialize::serialize(&nul, &mut buf, state.network_id).unwrap();
-            (hex::encode(buf), coin.value.to_string())
+            tagged_serialize(&qdo.backing_night.0, &mut buf).map_err(|e| {
+                tracing::error!(error = %e, "serialization of backing night failed");
+
+                Error::InternalError("serialization of backing night failed".to_string())
+            })?;
+
+            let value = DustOutput::from(qdo).updated_value(
+                &guard
+                    .generation_info(&qdo)
+                    .ok_or_else(|| Error::InternalError("backing night not found".to_string()))?,
+                current_time,
+                &ledger_parameters.dust,
+            );
+
+            Ok::<_, Error>((hex::encode(buf), value.to_string()))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
-    let pending = lock
-        .pending_spends
-        .iter()
-        .map(|(nul, _)| {
+    let pending = pending
+        .keys()
+        .map(|backing_night| {
             let mut buf = vec![];
-            serialize::serialize(&nul, &mut buf, state.network_id).unwrap();
+            tagged_serialize(&backing_night, &mut buf).unwrap();
             hex::encode(buf)
         })
         .collect();
@@ -335,26 +360,24 @@ async fn get_player_achievements(
 #[allow(clippy::too_many_arguments)]
 pub fn rocket(
     api: OnlineClient<SubstrateConfig>,
-    zswap_state: Arc<Mutex<midnight_zswap::local::State<InMemoryDB>>>,
-    network_id: NetworkId,
+    wallet_state: WalletState,
     sync_status: SharedSyncStatus,
-    inputs_service: PreProvingServiceChannelTx,
     whitelisting: Option<whitelisting::Constraints>,
     db: Db,
     addresses: (String, String),
-    secret_keys: SecretKeys,
+    secret_keys: DustSecretKey,
+    network_id: NetworkId,
 ) -> rocket::Rocket<rocket::Build> {
     let state = AppState {
         api,
-        zswap_state,
-        network_id,
+        wallet_state,
         sync_status,
-        inputs_service,
         whitelisting: Arc::new(whitelisting),
         db,
         legacy_address: addresses.0,
         bech32_address: addresses.1,
         secret_keys,
+        network_id,
     };
 
     let cors = CorsOptions::default()

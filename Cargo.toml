@@ -11,12 +11,9 @@ serde_json = "1.0"
 url = "2.2"
 hex = "0.4.3"
 rand = { version = "^0.8.4", features = ["getrandom"] }
-rand_chacha = "^0.3.1"
 reqwest = { version = "0.11", features = ["json"] }
 anyhow = "1.0.93"
 serde = { version = "1.0.215", features = ["derive"] }
-subxt = "0.38.0"
-subxt-signer = "0.38.0"
 clap = "4.5.27"
 rocket = { version = "0.5.1", features = ["json"] }
 tracing = "0.1.41"
@@ -26,10 +23,20 @@ sha256 = "1.5.0"
 deadpool-sqlite = "0.10.0"
 rayon = "1.10.0"
 bech32 = "0.11.0"
+subxt = "0.44.0"
+subxt-signer = "0.44.0"
+bip32 = "0.5.3"
 
-midnight-zswap = { path = "./midnight-ledger-prototype/zswap", features = ["offer-construction"] }
-midnight-ledger = { path = "./midnight-ledger-prototype/ledger", features = ["transaction-construction", "verifying", "serde", "transaction-semantics", "proving"] }
-midnight-transient-crypto = { path = "./midnight-ledger-prototype/transient-crypto", package = "midnight-transient-crypto" }
+mn-ledger = { git = "https://github.com/midnightntwrk/midnight-ledger", package = "midnight-ledger", tag = "ledger-6.1.0-alpha.3" } # From feature/unshielded-ledger
+ledger-storage = { git = "https://github.com/midnightntwrk/midnight-ledger", package = "midnight-storage", tag = "ledger-6.1.0-alpha.3", features = ["parity-db"] }
+coin-structure = { git = "https://github.com/midnightntwrk/midnight-ledger", package = "midnight-coin-structure", tag = "ledger-6.1.0-alpha.3" }
+onchain-runtime = { git = "https://github.com/midnightntwrk/midnight-ledger", package = "midnight-onchain-runtime", tag = "ledger-6.1.0-alpha.3" }
+base-crypto = { git = "https://github.com/midnightntwrk/midnight-ledger", package = "midnight-base-crypto", tag = "ledger-6.1.0-alpha.3" }
+transient-crypto = { git = "https://github.com/midnightntwrk/midnight-ledger", package = "midnight-transient-crypto", tag = "ledger-6.1.0-alpha.3" }
+zswap = { git = "https://github.com/midnightntwrk/midnight-ledger", package = "midnight-zswap", tag = "ledger-6.1.0-alpha.3" }
+zkir = { git = "https://github.com/midnightntwrk/midnight-ledger", package = "zkir", tag = "ledger-6.1.0-alpha.3" }
+midnight-serialize = { git = "https://github.com/midnightntwrk/midnight-ledger", package = "midnight-serialize", tag = "ledger-6.1.0-alpha.3" }
+
 
 [dependencies.rusqlite]
 version = "0.33.0"

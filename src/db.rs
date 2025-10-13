@@ -1,27 +1,24 @@
 use anyhow::Context as _;
 use deadpool_sqlite::{Config, Pool, Runtime};
-use midnight_zswap::{
-    local::State,
-    serialize::{deserialize, serialize, NetworkId},
-    storage::db::InMemoryDB,
-};
+use ledger_storage::db::InMemoryDB;
+use midnight_serialize::{tagged_deserialize, tagged_serialize};
+use mn_ledger::{dust::DustLocalState, structure::LedgerParameters};
 use rusqlite::OptionalExtension as _;
 use std::path::Path;
 
 #[derive(Clone)]
 pub struct Db {
     pool: Pool,
-    network_id: NetworkId,
 }
 
 impl Db {
-    pub async fn open_db(path: impl AsRef<Path>, network_id: NetworkId) -> anyhow::Result<Self> {
+    pub async fn open_db(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let cfg = Config::new(path.as_ref());
         let pool = cfg
             .create_pool(Runtime::Tokio1)
             .context("Failed to initialize sqlite pool")?;
 
-        let res = Self { pool, network_id };
+        let res = Self { pool };
 
         res.create_tables().await?;
 
@@ -32,10 +29,10 @@ impl Db {
         &self,
         id: &str,
         start_index: u64,
-        state: &State<InMemoryDB>,
+        state: &DustLocalState<InMemoryDB>,
     ) -> anyhow::Result<()> {
         let mut buf = vec![];
-        serialize(&state, &mut buf, self.network_id)?;
+        tagged_serialize(&state, &mut buf)?;
 
         let conn = self.pool.get().await.unwrap();
 
@@ -66,7 +63,7 @@ impl Db {
                 )?;
 
                 let row = stmt
-                    .query_row([id], |row| Ok(row.get::<_, u64>(0)?))
+                    .query_row([id], |row| row.get::<_, u64>(0))
                     .optional()
                     .context("Database access error")?;
 
@@ -78,7 +75,10 @@ impl Db {
         Ok(row)
     }
 
-    pub async fn get_state(&self, id: &str) -> anyhow::Result<Option<(u64, State<InMemoryDB>)>> {
+    pub async fn get_state(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<(u64, DustLocalState<InMemoryDB>)>> {
         let conn = self.pool.get().await.unwrap();
 
         let id = id.to_string();
@@ -102,7 +102,7 @@ impl Db {
             .unwrap()?;
 
         if let Some((start_index, unserialized_state)) = row {
-            let state = deserialize(std::io::Cursor::new(unserialized_state), self.network_id)
+            let state = tagged_deserialize(std::io::Cursor::new(unserialized_state))
                 .context("Can't deserialize state object")?;
 
             Ok(Some((start_index, state)))
@@ -272,6 +272,53 @@ impl Db {
         .unwrap()
     }
 
+    pub async fn persist_ledger_parameters(
+        &self,
+        id: &str,
+        params: &LedgerParameters,
+    ) -> anyhow::Result<()> {
+        let mut buf = vec![];
+        tagged_serialize(&params, &mut buf)?;
+
+        let conn = self.pool.get().await.unwrap();
+
+        let id = id.to_string();
+
+        conn.interact(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO ledger_parameters (id, parameters) VALUES (?1, ?2)",
+                (&id, &buf),
+            )
+        })
+        .await
+        .unwrap()
+        .context("Db error persisting state")?;
+
+        Ok(())
+    }
+
+    pub async fn get_ledger_parameters(&self, id: &str) -> anyhow::Result<LedgerParameters> {
+        let conn = self.pool.get().await.unwrap();
+        let id = id.to_string();
+
+        let result = conn
+            .interact(move |conn| {
+                conn.query_row(
+                    "SELECT parameters FROM ledger_parameters WHERE id = ?1",
+                    [&id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+            })
+            .await
+            .unwrap()
+            .context("could not retrieve ledger parameters from the db")?;
+
+        let params = tagged_deserialize(std::io::Cursor::new(result))
+            .context("Failed to deserialize ledger parameters from the db state")?;
+
+        Ok(params)
+    }
+
     async fn create_tables(&self) -> anyhow::Result<()> {
         let conn = self.pool.get().await.unwrap();
 
@@ -281,6 +328,14 @@ impl Db {
                 id TEXT PRIMARY KEY,
                 start_index INTEGER NOT NULL,
                 state BLOB NOT NULL
+            )",
+                (),
+            )?;
+
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS ledger_parameters (
+                id TEXT PRIMARY KEY,
+                parameters BLOB NOT NULL
             )",
                 (),
             )?;

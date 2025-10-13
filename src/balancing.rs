@@ -2,56 +2,63 @@ use crate::{
     db::Db,
     endpoints::Error,
     midnight::{self},
-    preproofing::{prove_tx_in_rayon_pool, PreProvingServiceChannelTx},
-    utils::OnDrop,
+    proving::prove_tx_in_rayon_pool,
+    utils::{get_current_time, OnDrop},
     whitelisting::{self, check_call, check_deploy},
+    NetworkId, WalletState,
 };
-use midnight_ledger::structure::{Proof, ProofPreimage, Transaction, DUMMY_PARAMETERS};
-use midnight_zswap::{
-    coin_structure::{self, coin::NATIVE_TOKEN},
-    keys::SecretKeys,
-    local::State,
-    serialize::{deserialize, serialize, NetworkId},
-    storage::db::InMemoryDB,
-    Offer, Output,
+use base_crypto::signatures::Signature;
+use coin_structure::coin::TokenType;
+use ledger_storage::{
+    arena::Sp,
+    db::InMemoryDB,
+    storage::{Array, HashMap},
 };
-use rand::{rngs::OsRng, Rng as _};
-use std::{cmp::Reverse, sync::Arc, time::Duration};
+use midnight_serialize::{tagged_deserialize, tagged_serialize};
+use mn_ledger::{
+    dust::{DustActions, DustOutput, DustSecretKey},
+    structure::{Intent, LedgerParameters, ProofKind, ProofMarker, Transaction},
+};
+use rand::rngs::OsRng;
 use subxt::{OnlineClient, SubstrateConfig};
-use tokio::sync::Mutex;
+use transient_crypto::commitment::PedersenRandomness;
+
+// Intent TTL for Dust spend
+// (chosen arbitrarily)
+const DUST_INTENT_TTL: i128 = 60;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn balance_and_submit_tx(
     api: &OnlineClient<SubstrateConfig>,
-    base_state: Arc<Mutex<State<InMemoryDB>>>,
+    wallet_state: WalletState,
     tx: &str,
-    network_id: NetworkId,
-    inputs_service: PreProvingServiceChannelTx,
     whitelisting: &Option<whitelisting::Constraints>,
     db: &Db,
-    secret_keys: &SecretKeys,
+    dust_secret_key: &DustSecretKey,
+    network_id: &NetworkId,
 ) -> Result<(String, Vec<String>), Error> {
-    // TODO: we should fetch this from the ledger state, but this works right now anyway.
-    let parameters = DUMMY_PARAMETERS;
+    let ledger_parameters = db
+        .get_ledger_parameters(crate::LEDGER_PARAMETERS_DB_ID)
+        .await?;
 
-    let unbalanced_tx: Transaction<Proof, InMemoryDB> =
-        deserialize(
-            std::io::Cursor::new(hex::decode(tx).map_err(|_| {
-                Error::BadRequest("Transaction payload is not valid hex".to_string())
-            })?),
-            network_id,
-        )
-        .map_err(|e| Error::BadRequest(format!("Invalid transaction. Error: {}", e)))?;
-
-    tracing::trace!(?unbalanced_tx, "unbalanced transaction received");
+    let unbalanced_tx: Transaction<Signature, ProofMarker, PedersenRandomness, InMemoryDB> =
+        tagged_deserialize(std::io::Cursor::new(hex::decode(tx).map_err(|_| {
+            Error::BadRequest("Transaction payload is not valid hex".to_string())
+        })?))
+        .map_err(|e| {
+            tracing::debug!(?e, "Invalid transaction");
+            Error::BadRequest(format!("Invalid transaction. Error: {e}"))
+        })?;
 
     if let Some(constraints) = whitelisting {
-        let is_call_to_known_contract = check_call(db, &unbalanced_tx, network_id).await?.is_some();
+        let is_call_to_known_contract = check_call(db, &unbalanced_tx).await?.is_some();
 
         if !is_call_to_known_contract {
-            let deploy = check_deploy(constraints, &unbalanced_tx, network_id)?;
+            let deploy = check_deploy(constraints, &unbalanced_tx)?;
 
             if let Some(address) = &deploy {
+                db.insert_contract_address(address).await?;
+
                 tracing::info!(address, "received new contract deploy");
             } else {
                 return Err(Error::BadRequest("Transaction not allowed".to_string()));
@@ -59,214 +66,185 @@ pub async fn balance_and_submit_tx(
         }
     }
 
-    let mut state_guard = base_state.lock().await;
-
-    // TODO: this probably only works for a single input and a single output.
+    // we don't keep the guard here
     //
-    // figure out how to generalize
-    let zswap_cost_estimation = 40500;
-    let cost = unbalanced_tx
-        .cost(&parameters)
-        .map_err(|e| Error::InternalError(e.to_string()))?;
+    // concurrency is controlled through the wallet_state.locked mutex instead.
+    //
+    // similarly, we don't update the dust_state in this function
+    //
+    // instead, only the subscription loop in main can update the state
+    let mut old_dust = wallet_state.dust_state.lock().await.clone();
 
-    let fees = cost + zswap_cost_estimation;
+    let mut merged_tx = unbalanced_tx;
 
-    let mut to_spend = vec![];
-    let mut curr_balance = 0;
+    let current_time = get_current_time();
 
-    let mut sorted_coins = state_guard
-        .coins
-        .iter()
-        // we only need to pay fees, so we don't care about utxos for other assets
-        .filter(|(_, coin)| coin.type_ == NATIVE_TOKEN)
-        .filter(|(null, _)| !state_guard.pending_spends.contains_key(null))
-        .collect::<Vec<_>>();
+    old_dust = old_dust.process_ttls(current_time);
 
-    // always pick the biggest unused utxo first, to spend evenly from the pool.
-    sorted_coins.sort_by_key(|(_, coin)| Reverse(coin.value));
+    let mut drop_guards = vec![];
 
-    for coin in sorted_coins {
-        curr_balance += coin.1.value;
-        to_spend.push(coin);
+    let segment = 10;
 
-        if curr_balance >= fees {
+    let mut locked_in_this_tx = std::collections::HashSet::new();
+    let mut balanced_unproven_tx = None;
+
+    let mut prev_dust = 0;
+
+    while let Some(mut dust_missing) = get_missing_dust(&ledger_parameters, &merged_tx)? {
+        dust_missing += prev_dust;
+
+        tracing::info!(
+            "Need to cover {dust_missing} specks of Dust. Adding {prev_dust} for the balancing utxo fees. Wallet balance: {}",
+            old_dust.wallet_balance(current_time)
+        );
+
+        let mut spends = Array::new();
+        let mut updated_dust = old_dust.clone();
+
+        for utxo in old_dust.utxos() {
+            let mut pending = wallet_state.locked.lock().await;
+
+            if pending.contains_key(&utxo.backing_night.0)
+                && !locked_in_this_tx.contains(&utxo.backing_night.0)
+            {
+                continue;
+            }
+
+            let gen_info = old_dust.generation_info(&utxo).ok_or_else(|| {
+                Error::InternalError("dust generation information not found".to_string())
+            })?;
+
+            let value = DustOutput::from(utxo).updated_value(
+                &gen_info,
+                current_time,
+                &ledger_parameters.dust,
+            );
+
+            let v_fee = u128::min(value, dust_missing);
+
+            dust_missing = dust_missing.saturating_sub(value);
+
+            let (new_dust, spend) = updated_dust
+                .spend(dust_secret_key, &utxo, v_fee, current_time)
+                .map_err(|e| Error::InternalError(e.to_string()))?;
+
+            updated_dust = new_dust;
+
+            pending.insert(utxo.backing_night.0, spend.old_nullifier);
+            locked_in_this_tx.insert(utxo.backing_night.0);
+
+            spends = spends.push(spend);
+
+            {
+                let wallet_state = wallet_state.clone();
+                drop_guards.push(OnDrop::new(move || {
+                    tokio::task::spawn(async move {
+                        wallet_state
+                            .locked
+                            .lock()
+                            .await
+                            .remove(&utxo.backing_night.0);
+                    });
+                }));
+            }
+
+            if dust_missing == 0 {
+                break;
+            }
+        }
+
+        // old_dust = updated_dust;
+
+        if dust_missing > 0 {
+            return Err(Error::NotAvailable(
+                "not enough funds to balance transaction".to_string(),
+            ));
+        }
+
+        let mut intent = Intent::empty(
+            &mut OsRng,
+            // the parameter is called ttl, but it's a timestamp
+            current_time + base_crypto::time::Duration::from_secs(DUST_INTENT_TTL),
+        );
+        intent.dust_actions = Some(Sp::new(DustActions {
+            spends,
+            registrations: vec![].into(),
+            ctime: current_time,
+        }));
+
+        let intents = HashMap::new().insert(segment, intent);
+        let tx2_unproven = Transaction::from_intents(network_id, intents);
+
+        if let Some(missing_dust) = get_missing_dust(&ledger_parameters, &tx2_unproven)? {
+            prev_dust += missing_dust;
+            continue;
+        } else {
+            balanced_unproven_tx.replace(tx2_unproven);
             break;
         }
     }
 
-    if curr_balance < fees {
-        tracing::error!(
-            curr_balance,
-            fees,
-            "not enough funds to balance transaction"
-        );
-        return Err(Error::NotAvailable("No funds available".to_string()));
-    }
+    let new_tx = prove_tx_in_rayon_pool(balanced_unproven_tx.unwrap()).await;
 
-    let mut inputs = vec![];
-    for coin in to_spend {
-        // TODO: what does this mean?
-        let segment = 0;
-        let (new_state, input) = state_guard
-            .spend(&mut OsRng, secret_keys, &coin.1, segment)
-            .map_err(|e| Error::InternalError(e.to_string()))?;
+    merged_tx = merged_tx
+        .merge(&new_tx)
+        .map_err(|e| Error::InternalError(e.to_string()))?;
 
-        *state_guard = new_state;
-        inputs.push(input);
-    }
+    let final_tx = merged_tx.seal(OsRng);
 
-    let coin_public_key = secret_keys.coin_public_key();
-    let enc_public_key = secret_keys.enc_public_key();
+    submit_tx(api, merged_tx, drop_guards, final_tx).await
+}
 
-    std::mem::drop(state_guard);
-
-    let mut on_drop_remove_inputs_from_pending = {
-        let inputs = inputs.clone();
-        OnDrop::new(move || {
-            tokio::task::spawn(async move {
-                let offer = Offer {
-                    inputs,
-                    outputs: vec![],
-                    transient: vec![],
-                    deltas: vec![],
-                };
-                let mut state = base_state.lock().await;
-                *state = state.apply_failed(&offer);
-            });
-        })
-    };
-
-    let (inputs_tx, inputs_rx) = tokio::sync::oneshot::channel();
-    inputs_service
-        .send((
-            inputs.iter().map(|input| input.nullifier).collect(),
-            inputs_tx,
+fn get_missing_dust<P: ProofKind<InMemoryDB>>(
+    ledger_parameters: &LedgerParameters,
+    merged_tx: &Transaction<Signature, P, transient_crypto::curve::EmbeddedFr, InMemoryDB>,
+) -> Result<Option<u128>, Error> {
+    Ok(merged_tx
+        .balance(Some(
+            merged_tx
+                .fees(ledger_parameters, true)
+                .map_err(|e| Error::InternalError(e.to_string()))?,
         ))
-        .await
-        .map_err(|e| Error::InternalError(e.to_string()))?;
-
-    let proven_inputs = tokio::time::timeout(Duration::from_secs(30), inputs_rx)
-        .await
-        .map_err(|_e| {
-            Error::InternalError(
-                "Prover task never produced a proof for the selected input".to_string(),
-            )
-        })?
-        // this one shouldn't really happen, but it's better to be panic free.
-        .map_err(|_e| Error::InternalError("Failed to get prove for selected input".to_string()))?;
-
-    let inputs_tx = proven_inputs
-        .into_iter()
-        .map(Ok)
-        .reduce(|tx1, tx2| tx1?.merge(&tx2?))
-        .ok_or_else(|| Error::InternalError("pre-computed proofs are empty".to_string()))?
-        .map_err(|e| Error::InternalError(e.to_string()))?;
-
-    let tx_ids = prove_and_submit(
-        inputs_tx.clone(),
-        curr_balance,
-        fees,
-        PublicKeys {
-            coin_public_key,
-            enc_public_key,
-        },
-        unbalanced_tx,
-        network_id,
-        api,
-    )
-    .await?;
-
-    on_drop_remove_inputs_from_pending.cancel();
-
-    Ok(tx_ids)
-}
-
-struct PublicKeys {
-    coin_public_key: coin_structure::coin::PublicKey,
-    enc_public_key: midnight_transient_crypto::encryption::PublicKey,
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn prove_and_submit(
-    inputs_tx: Transaction<Proof, InMemoryDB>,
-    curr_balance: u128,
-    fees: u128,
-    public_keys: PublicKeys,
-    unbalanced_tx: Transaction<Proof, InMemoryDB>,
-    network_id: NetworkId,
-    api: &OnlineClient<SubstrateConfig>,
-) -> Result<(String, Vec<String>), Error> {
-    let value = curr_balance - fees;
-
-    // TODO: what's this for?
-    let segment = 0;
-    let outputs_offer_tx = Offer {
-        inputs: vec![],
-        outputs: vec![Output::new(
-            &mut OsRng,
-            &coin_structure::coin::Info {
-                nonce: OsRng.gen(),
-                type_: NATIVE_TOKEN,
-                value,
-            },
-            segment,
-            &public_keys.coin_public_key,
-            Some(public_keys.enc_public_key),
-        )
-        .map_err(|e| Error::InternalError(e.to_string()))?],
-        transient: vec![],
-        deltas: vec![(NATIVE_TOKEN, fees as i128)],
-    };
-
-    let outputs_tx: Transaction<ProofPreimage, InMemoryDB> =
-        Transaction::new(outputs_offer_tx, None, None);
-
-    let instant = std::time::Instant::now();
-
-    let outputs_tx = prove_tx_in_rayon_pool(outputs_tx).await;
-
-    tracing::info!(
-        "proved outputs zswap in {} ms",
-        instant.elapsed().as_millis()
-    );
-
-    let final_tx = inputs_tx
-        .merge(&outputs_tx)
         .map_err(|e| Error::InternalError(e.to_string()))?
-        .merge(&unbalanced_tx)
-        .map_err(|e| Error::InternalError(e.to_string()))?;
+        .get(&(TokenType::Dust, 0))
+        .and_then(|bal| (*bal < 0).then_some((-*bal) as u128)))
+}
 
+async fn submit_tx(
+    api: &OnlineClient<SubstrateConfig>,
+    merged_tx: Transaction<Signature, ProofMarker, transient_crypto::curve::EmbeddedFr, InMemoryDB>,
+    drop_guards: Vec<OnDrop<impl FnOnce()>>,
+    final_tx: Transaction<
+        Signature,
+        ProofMarker,
+        transient_crypto::commitment::PureGeneratorPedersen,
+        InMemoryDB,
+    >,
+) -> Result<(String, Vec<String>), Error> {
     let mut serialized_final_tx = vec![];
 
-    serialize(
-        &final_tx,
-        std::io::Cursor::new(&mut serialized_final_tx),
-        network_id,
-    )
-    .map_err(|e| Error::InternalError(e.to_string()))?;
+    tagged_serialize(&final_tx, std::io::Cursor::new(&mut serialized_final_tx))
+        .map_err(|e| Error::InternalError(e.to_string()))?;
 
-    let tx_hash = hex::encode(final_tx.transaction_hash().0 .0);
+    let tx_hash = hex::encode(merged_tx.transaction_hash().0 .0);
 
-    let identifiers = final_tx
+    let identifiers = merged_tx
         .identifiers()
         .map(|id| {
             let mut buf = vec![];
-            serialize(&id, std::io::Cursor::new(&mut buf), network_id).map_err(|error| {
-                anyhow::anyhow!(
-                    "Failed to serialize transaction identifier, reason: {}",
-                    error
-                )
+            tagged_serialize(&id, std::io::Cursor::new(&mut buf)).map_err(|error| {
+                anyhow::anyhow!("Failed to serialize transaction identifier, reason: {error}",)
             })?;
             Ok(hex::encode(buf))
         })
         .collect::<anyhow::Result<Vec<_>>>()
         .map_err(|e| Error::InternalError(e.to_string()))?;
 
-    let hex_tx = hex::encode(serialized_final_tx);
+    tracing::info!("identifiers: {:?}", &identifiers);
 
     let extrinsic = midnight::tx()
         .midnight()
-        .send_mn_transaction(hex_tx.as_bytes().to_vec());
+        .send_mn_transaction(serialized_final_tx);
 
     let client = api.tx();
 
@@ -274,12 +252,16 @@ async fn prove_and_submit(
         .create_unsigned(&extrinsic)
         .map_err(|e| Error::InternalError(e.to_string()))?;
 
+    tracing::trace!("submitting tx");
+
     let watch = submittable
         .submit_and_watch()
         .await
         .map_err(|e| Error::InternalError(e.to_string()))?;
 
     let now = std::time::Instant::now();
+
+    tracing::trace!("waiting for finalization");
 
     let in_tx_block = watch
         .wait_for_finalized()
@@ -296,6 +278,10 @@ async fn prove_and_submit(
         .wait_for_success()
         .await
         .map_err(|e| Error::InternalError(e.to_string()))?;
+
+    for mut drop_guard in drop_guards {
+        drop_guard.cancel();
+    }
 
     Ok((tx_hash, identifiers))
 }

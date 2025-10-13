@@ -1,32 +1,16 @@
 ## Building
 
-
-```sh
-git clone ...
-git submodule update --init --recursive
 ```
-
-Then (only once)
-
-```sh
-pip install toml # or any preferred of getting the dependency
-python scripts/patch-midnight-ledger-prototype-with-local-deps.py
+cargo build --release
 ```
-
-The script modifies the `Cargo.toml` files inside the submodule so that
-they use local paths to the other dependencies in there, instead of using
-url dependencies to the same monorepo. This is done to avoid running into
-compilation issues with duplicated git dependencies, and it also makes patching
-easier.
 
 ## Local chain usage
 
-1. Setup the local chain and fund the batcher.
+1. Setup the local chain.
 
 ```sh
 cd ./local-chain-setup
 source .envrc
-npm install
 docker compose up
 ```
 

@@ -1,4 +1,3 @@
-use super::graphql_deser;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -22,17 +21,13 @@ impl SharedSyncStatus {
         }
     }
 
-    pub async fn update(
-        &self,
-        progress_update: graphql_deser::ProgressUpdate,
-        highest_known_index: u64,
-    ) {
+    #[tracing::instrument(skip(self))]
+    pub async fn update(&self, current_index: u64, highest_known_index: u64) {
         let mut sync_status = self.inner.write().await;
 
-        let mut sync_percent =
-            highest_known_index as f64 / progress_update.highest_relevant_wallet_index as f64;
+        let mut sync_percent = highest_known_index as f64 / current_index as f64;
 
-        if progress_update.highest_relevant_wallet_index == 0 {
+        if current_index == 0 {
             sync_percent = 1.0;
         }
 
@@ -47,11 +42,7 @@ impl SharedSyncStatus {
 
             *sync_status = SyncStatus::UpToDate;
         } else {
-            tracing::info!(
-                "progress update: {}/{}",
-                highest_known_index,
-                progress_update.highest_relevant_wallet_index
-            );
+            tracing::info!("progress update: {}/{}", current_index, highest_known_index);
             let notify = if let SyncStatus::Syncing {
                 progress: _,
                 notify,
@@ -67,24 +58,6 @@ impl SharedSyncStatus {
                 progress: sync_percent * 100.0,
                 notify,
             };
-        }
-    }
-
-    pub async fn wait_for_ready(&self) {
-        let mut sync_status_guard = self.inner.write().await;
-        if let SyncStatus::Syncing {
-            progress: _,
-            notify,
-        } = &mut *sync_status_guard
-        {
-            let waiter = Arc::new(tokio::sync::Notify::new());
-            notify.replace(Arc::clone(&waiter));
-
-            std::mem::drop(sync_status_guard);
-            tracing::info!("waiting for wallet to sync before starting to pre-compute proofs");
-            waiter.notified().await;
-        } else {
-            std::mem::drop(sync_status_guard);
         }
     }
 

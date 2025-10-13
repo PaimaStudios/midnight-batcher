@@ -1,22 +1,16 @@
 use crate::db::Db;
 use anyhow::Context as _;
-use midnight_ledger::{
-    onchain_runtime::state::EntryPointBuf,
-    structure::{ContractAction, Proof, Transaction},
-};
-use midnight_transient_crypto::proofs::VerifierKey;
-use midnight_zswap::{
-    serialize::{deserialize, serialize, NetworkId},
-    storage::db::InMemoryDB,
-};
+use base_crypto::signatures::Signature;
+use ledger_storage::db::InMemoryDB;
+use midnight_serialize::{tagged_deserialize, tagged_serialize};
+use mn_ledger::structure::{ContractAction, ProofMarker, Transaction};
+use onchain_runtime::state::EntryPointBuf;
 use std::{collections::HashMap, path::Path, sync::Arc};
+use transient_crypto::{commitment::PedersenRandomness, proofs::VerifierKey};
 
 pub type Constraints = Arc<HashMap<EntryPointBuf, VerifierKey>>;
 
-pub fn read_constraints(
-    dir: impl AsRef<Path>,
-    network_id: NetworkId,
-) -> anyhow::Result<Constraints> {
+pub fn read_constraints(dir: impl AsRef<Path>) -> anyhow::Result<Constraints> {
     let mut res = HashMap::default();
 
     let dir = std::fs::read_dir(dir.as_ref()).context("Failed to read keys directory")?;
@@ -33,7 +27,7 @@ pub fn read_constraints(
 
             let checksum = sha256::digest(&raw);
 
-            let vk = deserialize::<VerifierKey, _>(std::io::Cursor::new(raw), network_id)?;
+            let vk = tagged_deserialize::<VerifierKey>(std::io::Cursor::new(raw))?;
 
             tracing::info!(
                 sha256 = hex::encode(checksum),
@@ -50,29 +44,38 @@ pub fn read_constraints(
 
 pub async fn check_call(
     db: &Db,
-    tx: &Transaction<Proof, InMemoryDB>,
-    network_id: NetworkId,
+    tx: &Transaction<Signature, ProofMarker, PedersenRandomness, InMemoryDB>,
 ) -> anyhow::Result<Option<String>> {
     let tx = match tx {
         Transaction::Standard(standard_transaction) => standard_transaction,
-        Transaction::ClaimMint(_) => return Ok(None),
+        Transaction::ClaimRewards(_) => return Ok(None),
     };
 
-    let Some(contract_calls) = &tx.contract_calls else {
-        return Ok(None);
-    };
+    let mut cc = None;
 
-    if contract_calls.calls.len() > 1 {
-        return Ok(None);
+    for (_segment, intent) in tx.intents() {
+        for action in intent.actions.iter_deref() {
+            match action {
+                ContractAction::Call(call) => {
+                    if cc.replace(call.clone()).is_some() {
+                        tracing::debug!("transaction does have more than one contract call");
+
+                        return Ok(None);
+                    }
+                }
+                ContractAction::Deploy(_) => return Ok(None),
+                ContractAction::Maintain(_) => return Ok(None),
+            }
+        }
     }
 
-    let ContractAction::Call(call) = &contract_calls.calls[0] else {
+    let Some(call) = cc else {
         return Ok(None);
     };
 
     let mut buf = vec![];
 
-    serialize(&call.address, &mut buf, network_id)?;
+    tagged_serialize(&call.address, &mut buf)?;
 
     let hex_address = hex::encode(buf);
 
@@ -85,28 +88,32 @@ pub async fn check_call(
 
 pub fn check_deploy(
     constraints: &Constraints,
-    tx: &Transaction<Proof, InMemoryDB>,
-    network_id: NetworkId,
+    tx: &Transaction<Signature, ProofMarker, PedersenRandomness, InMemoryDB>,
 ) -> anyhow::Result<Option<String>> {
     let tx = match tx {
         Transaction::Standard(standard_transaction) => standard_transaction,
-        Transaction::ClaimMint(_) => return Ok(None),
+        Transaction::ClaimRewards(_) => return Ok(None),
     };
 
-    let Some(contract_calls) = &tx.contract_calls else {
-        tracing::debug!("transaction does not have contract calls");
-        return Ok(None);
-    };
+    let mut deploy = None;
 
-    if contract_calls.calls.len() > 1 {
-        tracing::debug!(
-            "transaction does have more than one ({}) contract call, only a single call per tx allowed", contract_calls.calls.len()
-        );
+    for (_segment, intent) in tx.intents() {
+        for action in intent.actions.iter_deref() {
+            match action {
+                ContractAction::Deploy(contract_deploy) => {
+                    if deploy.replace(contract_deploy.clone()).is_some() {
+                        tracing::debug!("transaction does have more than one contract deploy");
 
-        return Ok(None);
+                        return Ok(None);
+                    }
+                }
+                ContractAction::Call(_) => return Ok(None),
+                ContractAction::Maintain(_) => return Ok(None),
+            }
+        }
     }
 
-    let ContractAction::Deploy(deploy) = &contract_calls.calls[0] else {
+    let Some(deploy) = deploy else {
         return Ok(None);
     };
 
@@ -141,7 +148,7 @@ pub fn check_deploy(
     }
 
     let mut buf = vec![];
-    serialize(&deploy.address(), &mut buf, network_id)?;
+    tagged_serialize(&deploy.address(), &mut buf)?;
     let hex_address = hex::encode(buf);
 
     Ok(Some(hex_address))

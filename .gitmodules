@@ -1,4 +1,0 @@
-[submodule "midnight-ledger-prototype"]
-	path = midnight-ledger-prototype
-	url = https://github.com/input-output-hk/midnight-ledger-prototype.git
-	ignore = dirty

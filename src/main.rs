@@ -5,29 +5,26 @@ mod balancing;
 mod db;
 mod endpoints;
 mod graphql_deser;
-mod preproofing;
+mod proving;
 mod sync_status;
 mod utils;
 mod whitelisting;
 
 use anyhow::Context as _;
+use base_crypto::hash::HashOutput;
+use base_crypto::time::Duration;
+use bip32::{DerivationPath, XPrv};
 use clap::{arg, Command};
 use db::Db;
 use futures::{SinkExt, StreamExt};
-use midnight_ledger::onchain_runtime::state::{ContractState, StateValue};
-use midnight_ledger::onchain_runtime::state_value_ext::StateValueExt;
-use midnight_ledger::structure::{Proof, Transaction, TransactionHash};
-use midnight_zswap::base_crypto::fab::{AlignmentAtom, AlignmentSegment};
-use midnight_zswap::keys::{SecretKeys, Seed};
-use midnight_zswap::local::State;
-use midnight_zswap::serialize::{deserialize, NetworkId, Serializable};
-use midnight_zswap::storage::db::InMemoryDB;
-use preproofing::pre_proving_service;
-// use rand::SeedableRng as _;
-// use rand_chacha::ChaCha20Rng;
+use ledger_storage::db::InMemoryDB;
+use mn_ledger::{
+    dust::{DustLocalState, DustNullifier, DustParameters, DustSecretKey},
+    events::{Event, EventDetails},
+};
 use serde_json::json;
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::{path::PathBuf, str::FromStr as _};
 use subxt::{OnlineClient, SubstrateConfig};
 use sync_status::{SharedSyncStatus, SyncStatus};
 use tokio::sync::Mutex;
@@ -37,48 +34,23 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
+type NetworkId = String;
+
 const STABLE_STATE_ID: &str = "committed";
-const WS_INDEXER_LOCALHOST: &str = "ws://127.0.0.1:8088/api/v1/graphql/ws";
-const HTTP_INDEXER_LOCALHOST: &str = "http://127.0.0.1:8088/api/v1/graphql";
+const LEDGER_PARAMETERS_DB_ID: &str = "ledger_parameters_key";
+const WS_INDEXER_LOCALHOST: &str = "ws://127.0.0.1:8088/api/v3/graphql/ws";
+const HTTP_INDEXER_LOCALHOST: &str = "http://127.0.0.1:8088/api/v3/graphql";
 const NODE_LOCALHOST: &str = "ws://127.0.0.1:9944";
+
+const DUST_DERIVATION_PATH: &str = "m/44'/2400'/0'/2/0";
 
 #[subxt::subxt(runtime_metadata_path = "metadata.scale")]
 pub mod midnight {}
 
-fn legacy_address(zswap_state: &SecretKeys) -> String {
-    let pk = zswap_state.coin_public_key();
-    let epk = zswap_state.enc_public_key();
-
-    let pk_hex = hex::encode(pk.0 .0);
-    let mut buf = vec![];
-
-    <_ as Serializable>::serialize(&epk, &mut buf).unwrap();
-
-    let ec_hex = hex::encode(&buf);
-
-    format!("{}|{}", pk_hex, ec_hex)
-}
-
-fn bech32_address(secret_keys: &SecretKeys, network_id: NetworkId) -> anyhow::Result<String> {
-    let hrp = match network_id {
-        NetworkId::Undeployed => "mn_shield-addr_undeployed",
-        NetworkId::TestNet => "mn_shield-addr_test",
-        NetworkId::MainNet => "mn_shield-addr",
-        NetworkId::DevNet => "mn_shield-addr_dev",
-        _ => anyhow::bail!("unknown network id"),
-    };
-
-    let mut buffer = vec![];
-    <_ as Serializable>::serialize(&secret_keys.coin_public_key(), &mut buffer)
-        .context("Serialization failed on encryption secret key")?;
-    <_ as Serializable>::serialize(&secret_keys.enc_public_key(), &mut buffer)
-        .context("Serialization failed on encryption secret key")?;
-
-    bech32::encode::<bech32::Bech32m>(
-        bech32::Hrp::parse(hrp).context("Couldn't parse bech32 HRP")?,
-        &buffer,
-    )
-    .context("bech32 encoding of viewing key")
+#[derive(Clone)]
+pub(crate) struct WalletState {
+    pub(crate) dust_state: Arc<Mutex<DustLocalState<InMemoryDB>>>,
+    pub(crate) locked: Arc<Mutex<std::collections::HashMap<HashOutput, DustNullifier>>>,
 }
 
 #[rocket::main]
@@ -86,8 +58,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let matches = Command::new("Midnight Batcher")
-        .version("1.0")
-        .author("Enzo Cioppettini <enzo@dcspark.com>")
+        .version("2.0")
+        .author("Enzo Cioppettini <enzo.cioppettini@midnight.foundation>")
         .about("Midnight paymaster for Paima")
         .arg(arg!(--"indexer-ws" <WEBSOCKET_URL>).default_value(WS_INDEXER_LOCALHOST))
         .arg(arg!(--"indexer-http" <HTTP_URL>).default_value(HTTP_INDEXER_LOCALHOST))
@@ -114,7 +86,10 @@ async fn main() -> anyhow::Result<()> {
     let http_indexer = matches.get_one::<String>("indexer-http").expect("default");
     let node = matches.get_one::<String>("node").expect("default");
     let credentials = matches.get_one::<PathBuf>("secret").expect("default");
-    let network = matches.get_one::<String>("network").expect("default");
+    let network_id = matches
+        .get_one::<String>("network")
+        .expect("default")
+        .clone();
     let db = matches.get_one::<PathBuf>("db").expect("default");
     let whitelisting = matches.get_one::<PathBuf>("allowed-contract");
 
@@ -122,54 +97,51 @@ async fn main() -> anyhow::Result<()> {
     info!("Indexer HTTP: {:?}", http_indexer);
     info!("File path: {:?}", node);
     info!("Wallet: {:?}", credentials);
-    info!("Network: {}", network);
+    info!("Network: {}", network_id);
 
     let api = OnlineClient::<SubstrateConfig>::from_url(node)
         .await
         .context("Couldn't establish connection with the node")?;
 
-    let network_id = match network.as_ref() {
-        "testnet" => NetworkId::TestNet,
-        "undeployed" => NetworkId::Undeployed,
-        _ => anyhow::bail!("invalid network"),
-    };
-
     let whitelisting = whitelisting
-        .map(|path| whitelisting::read_constraints(path, network_id))
+        .map(whitelisting::read_constraints)
         .transpose()?;
 
     let indexer_ws_url = Url::parse(ws_indexer).context("Invalid indexer ws URL")?;
     let indexer_http_url = Url::parse(http_indexer).context("Invalid indexer http URL")?;
 
-    let db = Db::open_db(db, network_id).await?;
+    let db = Db::open_db(db).await?;
 
     let seed = std::fs::read_to_string(credentials).context("Failed to read credentials")?;
 
-    // let mut rng = ChaCha20Rng::from_seed(
-    //     <[u8; 32]>::try_from(hex::decode(seed.trim()).context("seed should be a valid hex")?)
-    //         .map_err(|_| anyhow::anyhow!("expected seed to contain 32 bytes"))?,
-    // );
+    let root_seed =
+        <[u8; 32]>::try_from(hex::decode(seed.trim()).context("seed should be a valid hex")?)
+            .map_err(|_| anyhow::anyhow!("expected seed to contain 32 bytes"))?;
 
     let maybe_latest_state = db.get_state(STABLE_STATE_ID).await?;
-
-    // let secret_keys = SecretKeys::from_rng_seed(&mut rng);
-    let secret_keys = SecretKeys::from(Seed::from(
-        <[u8; 32]>::try_from(hex::decode(seed.trim()).context("seed should be a valid hex")?)
-            .map_err(|_| anyhow::anyhow!("expected seed to contain 32 bytes"))?,
-    ));
 
     let initial_state = maybe_latest_state
         .as_ref()
         .map(|(_, state)| state.clone())
-        .unwrap_or_else(State::new);
+        .unwrap_or_else(|| {
+            let initial_dust_params = DustParameters {
+                // the values should be updated from the graphql event
+                night_dust_ratio: 0,
+                generation_decay_rate: 0,
+                dust_grace_period: Duration::from_secs(0),
+            };
+            DustLocalState::<InMemoryDB>::new(initial_dust_params)
+        });
 
-    let legacy_address = legacy_address(&secret_keys);
+    // I don't know the proper way of computing these yet.
+    //
+    // let legacy_address = legacy_address(&secret_keys);
 
-    info!("Legacy address {}", legacy_address);
+    // info!("Legacy address {}", legacy_address);
 
-    let bech32_address = bech32_address(&secret_keys, network_id)?;
+    // let bech32_address = bech32_address(&secret_keys, network_id)?;
 
-    info!("Bech32 address {}", bech32_address);
+    // info!("Bech32 address {}", bech32_address);
 
     let sync_status = sync_status::SharedSyncStatus::new(SyncStatus::Syncing {
         progress: 0.0,
@@ -178,23 +150,26 @@ async fn main() -> anyhow::Result<()> {
 
     let initial_state = Arc::new(Mutex::new(initial_state));
 
-    let notify_tx = Arc::new(tokio::sync::Notify::new());
+    let wallet_state = WalletState {
+        dust_state: initial_state,
+        locked: Arc::new(Mutex::new(std::collections::HashMap::new())),
+    };
 
-    let client = reqwest::Client::new();
+    let derivation_path = DerivationPath::from_str(DUST_DERIVATION_PATH)
+        .unwrap_or_else(|err| panic!("Error calculating the `DerivationPath`: {err}"));
+    let derived = XPrv::derive_from_path(root_seed.as_ref(), &derivation_path)
+        .unwrap_or_else(|err| panic!("Error calculating the `ExtendedPrivateKey`: {err}"));
 
-    let session_id =
-        connect_wallet_to_indexer(&indexer_http_url, &secret_keys, &client, network_id).await?;
+    let derived_seed = derived.private_key().to_bytes().into();
+
+    let sk = DustSecretKey::derive_secret_key(&derived_seed);
 
     let indexer_task_handle = {
-        let initial_state = Arc::clone(&initial_state);
+        let wallet_state = wallet_state.clone();
         let sync_status = sync_status.clone();
-        let notify_tx = Arc::clone(&notify_tx);
-        let whitelisting = whitelisting.clone();
         let db = db.clone();
-        let secret_keys = secret_keys.clone();
-        let client = client.clone();
+        let sk = sk.clone();
         let indexer_http_url = indexer_http_url.clone();
-        let session_id = session_id.clone();
 
         tokio::task::spawn(async move {
             let sleep_time = std::time::Duration::from_secs(10);
@@ -206,15 +181,9 @@ async fn main() -> anyhow::Result<()> {
                         indexer_ws_url: indexer_ws_url.clone(),
                         indexer_http_url: indexer_http_url.clone(),
                     },
-                    Arc::clone(&initial_state),
-                    network_id,
+                    wallet_state.clone(),
                     sync_status.clone(),
-                    Arc::clone(&notify_tx),
-                    // TODO: maybe this is too big? but shouldn't be
-                    whitelisting.clone(),
-                    secret_keys.clone(),
-                    client.clone(),
-                    session_id.clone(),
+                    sk.clone(),
                 )
                 .await;
 
@@ -234,27 +203,16 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    let (pre_proving_comm_tx, pre_proving_comm_rx) = tokio::sync::mpsc::channel(1000);
-
-    tokio::task::spawn(pre_proving_service(
-        Arc::clone(&initial_state),
-        notify_tx,
-        pre_proving_comm_rx,
-        sync_status.clone(),
-        secret_keys.clone(),
-    ));
-
     let rocket_task_handle = tokio::task::spawn(async move {
         endpoints::rocket(
             api,
-            initial_state,
-            network_id,
+            wallet_state,
             sync_status,
-            pre_proving_comm_tx,
             whitelisting,
             db,
-            (legacy_address, bech32_address),
-            secret_keys.clone(),
+            ("todo".to_string(), "todo".to_string()),
+            sk.clone(),
+            network_id.clone(),
         )
         .launch()
         .await
@@ -275,10 +233,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    if let Err(err) = session_id.disconnect(&indexer_http_url, &client).await {
-        tracing::warn!(reason = ?err, "error while disconnecting wallet");
-    }
-
     Ok(())
 }
 
@@ -291,24 +245,20 @@ struct IndexerUrls {
 async fn wallet_indexer(
     db: Db,
     indexer_urls: IndexerUrls,
-    latest_state: Arc<Mutex<State<InMemoryDB>>>,
-    network_id: NetworkId,
+    wallet_state: WalletState,
     sync_status: SharedSyncStatus,
-    signal: Arc<tokio::sync::Notify>,
-    constraints: Option<whitelisting::Constraints>,
-    secret_keys: SecretKeys,
-    client: reqwest::Client,
-    session_id: SessionId,
+    secret_key: DustSecretKey,
 ) -> anyhow::Result<()> {
     let maybe_latest_state = db.get_state(STABLE_STATE_ID).await?;
 
     let start_from = maybe_latest_state
-        .map(|(start_index, _)| start_index + 1)
+        // technically this should be `start_index + 1`, but we get a redundant
+        // event just to get the proper maxId, see the comment in `skip_first`
+        // variable below
+        .map(|(start_index, _)| start_index)
         .unwrap_or(0);
 
     tracing::info!("starting sync from {}", start_from);
-
-    let mut confirmed_state = latest_state.lock().await.clone();
 
     let mut req = indexer_urls
         .indexer_ws_url
@@ -349,34 +299,13 @@ async fn wallet_indexer(
     let subscription_query = {
         let query = format!(
             r#"subscription {{
-                        wallet(sessionId: "{}", index: {}, sendProgressUpdates: true) {{
+                        dustLedgerEvents(id: {start_from}) {{
                             __typename
-                            ... on ProgressUpdate {{
-                                    highestIndex
-                                    highestRelevantIndex
-                                    highestRelevantWalletIndex
-
-                            }}
-                            ... on ViewingUpdate {{
-                                index
-                                update {{
-                                    __typename
-                                    ... on MerkleTreeCollapsedUpdate {{
-                                        protocolVersion
-                                        start
-                                        end
-                                        update
-                                    }}
-                                    ... on RelevantTransaction {{
-                                        start
-                                        end
-                                        transaction {{ hash raw applyStage block {{ hash height }} }}
-                                    }}
-                                }}
-                            }}
+                                id
+                                raw
+                                maxId
                         }}
                     }}"#,
-            session_id.0, start_from
         );
 
         json!({
@@ -393,6 +322,12 @@ async fn wallet_indexer(
         .await
         .context("Failed to send subscription query initiation message")?;
 
+    // a bit hacky, but we use this to set the current sync progress when the
+    // batcher restarts, since it's possible there are no new events, and the
+    // only way we can know that is by starting from a known point and checking
+    // the maxId
+    let mut skip_first = start_from > 0;
+
     while let Some(message) = read.next().await {
         match message {
             Ok(tungstenite::Message::Text(text)) => {
@@ -400,380 +335,70 @@ async fn wallet_indexer(
                     Ok(val) => val,
                     Err(error) => {
                         tracing::error!("raw text: {}", text);
-                        anyhow::bail!(
-                            "json deserialization error of graphql response. {:?}",
-                            error
-                        );
+                        anyhow::bail!("json deserialization error of graphql response: {error:?}");
                     }
                 };
 
-                let updates = match val.payload.data.wallet {
-                    graphql_deser::TransactionOrUpdate::ViewingUpdate(tx_added) => tx_added.update,
-                    graphql_deser::TransactionOrUpdate::ProgressUpdate(pu) => {
-                        sync_status
-                            .update(
-                                pu,
-                                db.get_last_known_tx_index(STABLE_STATE_ID)
-                                    .await?
-                                    .unwrap_or(0),
-                            )
-                            .await;
-                        continue;
-                    }
-                };
+                let event_bytes = hex::decode(val.payload.data.dust_ledger_events.raw).unwrap();
 
-                for update in updates {
-                    match update {
-                        graphql_deser::ZswapChainStateUpdate::RelevantTransaction(update) => {
-                            process_transaction(
-                                update,
-                                network_id,
-                                &db,
-                                &indexer_urls.indexer_http_url,
-                                &latest_state,
-                                &signal,
-                                &constraints,
-                                &secret_keys,
-                                &client,
-                                &mut confirmed_state,
-                            )
-                            .await?
-                        }
-                        graphql_deser::ZswapChainStateUpdate::MerkleTreeCollapsedUpdate(
-                            collapsed_update,
-                        ) => {
-                            process_collapsed_update(
-                                &db,
-                                &latest_state,
-                                network_id,
-                                &mut confirmed_state,
-                                collapsed_update,
-                            )
-                            .await?;
-                        }
-                    }
+                let dust_event = midnight_serialize::tagged_deserialize::<Event<InMemoryDB>>(
+                    std::io::Cursor::new(event_bytes),
+                )
+                .context("failed to deserialize dust event")?;
+
+                tracing::info!("received dust event from the indexer");
+
+                sync_status
+                    .update(
+                        val.payload.data.dust_ledger_events.id,
+                        val.payload.data.dust_ledger_events.max_id,
+                    )
+                    .await;
+
+                if skip_first {
+                    skip_first = false;
+                    continue;
                 }
+
+                let mut dust_state = wallet_state.dust_state.lock().await;
+
+                if let EventDetails::DustSpendProcessed { nullifier, .. } = &dust_event.content {
+                    let mut guard = wallet_state.locked.lock().await;
+
+                    let find = guard
+                        .iter()
+                        .find(|(_, nul)| nullifier == *nul)
+                        .map(|(key, _)| *key);
+
+                    if let Some(key) = find {
+                        tracing::info!("removed pending utxo");
+                        guard.remove(&key);
+                    }
+                };
+
+                if let EventDetails::ParamChange(ledger_parameters) = &dust_event.content {
+                    db.persist_ledger_parameters(LEDGER_PARAMETERS_DB_ID, ledger_parameters)
+                        .await?;
+                };
+
+                *dust_state = dust_state
+                    .replay_events(&secret_key, &[dust_event])
+                    .context("Couldn't apply dust event")?;
+
+                db.persist_state(
+                    STABLE_STATE_ID,
+                    val.payload.data.dust_ledger_events.id,
+                    &dust_state,
+                )
+                .await?;
             }
             Ok(_) => {}
             Err(e) => {
                 tracing::error!("graphql suscription error: {}", e);
-                anyhow::bail!("graphql subscription error: {}", e);
+                anyhow::bail!("graphql subscription error: {e}");
             }
         }
     }
 
     Ok(())
-}
-
-async fn process_collapsed_update(
-    db: &Db,
-    latest_state: &Arc<Mutex<State<InMemoryDB>>>,
-    network_id: NetworkId,
-    confirmed_state: &mut State<InMemoryDB>,
-    collapsed_update: graphql_deser::MerkleTreeCollapsedUpdate,
-) -> Result<(), anyhow::Error> {
-    let collapsed_update_raw = hex::decode(collapsed_update.update)
-        .context("expected raw collapsed update to be in hex")?;
-
-    let collapsed_update = deserialize::<
-        midnight_transient_crypto::merkle_tree::MerkleTreeCollapsedUpdate,
-        _,
-    >(std::io::Cursor::new(collapsed_update_raw), network_id)
-    .context("Collapsed update can't be deserialized")?;
-
-    *confirmed_state = confirmed_state.apply_collapsed_update(&collapsed_update)?;
-    let mut unconfirmed_state_guard = latest_state.lock().await;
-
-    *unconfirmed_state_guard = unconfirmed_state_guard.apply_collapsed_update(&collapsed_update)?;
-
-    db.persist_state(STABLE_STATE_ID, collapsed_update.start, &*confirmed_state)
-        .await?;
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn process_transaction(
-    update: graphql_deser::RelevantTransaction,
-    network_id: NetworkId,
-    db: &Db,
-    indexer_http_url: &Url,
-    latest_state: &Arc<Mutex<State<InMemoryDB>>>,
-    signal: &Arc<tokio::sync::Notify>,
-    constraints: &Option<whitelisting::Constraints>,
-    secret_keys: &SecretKeys,
-    client: &reqwest::Client,
-    confirmed_state: &mut State<InMemoryDB>,
-) -> anyhow::Result<()> {
-    let transaction = update.transaction;
-
-    let apply_stage = transaction.apply_stage;
-
-    if apply_stage == "FailEntirely" {
-        return Ok(());
-    }
-
-    let tx_raw = hex::decode(transaction.raw).context("expected raw transaction to be in hex")?;
-
-    let tx: Transaction<Proof, InMemoryDB> =
-        deserialize::<Transaction<Proof, InMemoryDB>, _>(std::io::Cursor::new(tx_raw), network_id)
-            .context("Transaction can't be deserialized")?;
-
-    let current_coins = confirmed_state.coins.clone();
-    let mut unconfirmed_state_guard = latest_state.lock().await;
-
-    if let Some(constraints) = constraints.as_ref() {
-        let deploy_address = whitelisting::check_deploy(constraints, &tx, network_id)?;
-
-        if let Some(deploy_address) = &deploy_address {
-            db.insert_contract_address(deploy_address).await?;
-
-            tracing::info!("detected new contract address: {}", deploy_address);
-        }
-
-        let contract_call_address = whitelisting::check_call(db, &tx, network_id).await?;
-
-        if let Some(contract_address) = deploy_address.or(contract_call_address) {
-            game_specific_indexing(
-                network_id,
-                db,
-                indexer_http_url,
-                client,
-                transaction.block.height,
-                tx.transaction_hash(),
-                contract_address,
-            )
-            .await?;
-        }
-    }
-
-    let mut unconfirmed_state = unconfirmed_state_guard.clone();
-
-    match tx {
-        Transaction::Standard(stx) => {
-            *confirmed_state = confirmed_state.apply(secret_keys, &stx.guaranteed_coins);
-            unconfirmed_state = unconfirmed_state.apply(secret_keys, &stx.guaranteed_coins);
-
-            if let Some(fallible_coins) = &stx.fallible_coins {
-                *confirmed_state = confirmed_state.apply(secret_keys, fallible_coins);
-                unconfirmed_state = unconfirmed_state.apply(secret_keys, fallible_coins);
-            }
-        }
-        Transaction::ClaimMint(cmtx) => {
-            *confirmed_state = confirmed_state.apply_mint(secret_keys, &cmtx.mint);
-            unconfirmed_state = unconfirmed_state.apply_mint(secret_keys, &cmtx.mint);
-        }
-    }
-
-    *unconfirmed_state_guard = unconfirmed_state;
-
-    if current_coins == confirmed_state.coins {
-        return Ok(());
-    }
-
-    signal.notify_waiters();
-
-    db.persist_state(STABLE_STATE_ID, update.end, confirmed_state)
-        .await?;
-
-    // dbg!(&confirmed_state.coins);
-    // dbg!(&confirmed_state.merkle_tree);
-    // dbg!(&confirmed_state.merkle_tree.root());
-    Ok(())
-}
-
-async fn game_specific_indexing(
-    network_id: NetworkId,
-    db: &Db,
-    indexer_http_url: &Url,
-    client: &reqwest::Client,
-    block_height: u64,
-    tx_hash: TransactionHash,
-    contract_address: String,
-) -> Result<(), anyhow::Error> {
-    let res: serde_json::Value = client
-        .post(indexer_http_url.to_string())
-        .json(&json!({
-            "query": format!(r#"{{
-                            contractAction(address: "{}", offset: {{ transactionOffset: {{ hash: "{}" }} }} ) {{
-                                state
-                            }}
-                        }}"#, contract_address, hex::encode(tx_hash.0.0)),
-        }))
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    let state_raw = res
-        .get("data")
-        .and_then(|data| data.get("contractAction"))
-        .and_then(|contract| contract.get("state"))
-        .and_then(|state| state.as_str())
-        .ok_or(anyhow::anyhow!(
-            "Unexpected format for contract state query {}",
-            res.to_string()
-        ))?;
-
-    let state_raw = hex::decode(state_raw).context(anyhow::anyhow!(
-        "Expected hex string for the contract statestate"
-    ))?;
-
-    let state: ContractState<InMemoryDB> =
-        deserialize(std::io::Cursor::new(state_raw), network_id)?;
-    let mut flattened_entries = vec![];
-    match &state.data {
-        StateValue::Array(arr) => {
-            for entry in arr.iter() {
-                match &*entry {
-                    StateValue::Array(arr) => {
-                        for entry in arr.iter() {
-                            flattened_entries.push(entry.as_cell().unwrap())
-                        }
-                    }
-                    StateValue::Cell(cell) => {
-                        flattened_entries.push(Arc::clone(cell));
-                    }
-                    _ => todo!(),
-                }
-            }
-        }
-        _ => todo!(),
-    }
-    let mapped_entries = flattened_entries
-        .clone()
-        .into_iter()
-        .rev()
-        .take(4)
-        .rev()
-        .map(|state_var| {
-            let mut joined = state_var
-                .value
-                .0
-                .iter()
-                .zip(state_var.alignment.0.iter())
-                .map(|(value, alignment)| match &alignment {
-                    AlignmentSegment::Atom(atom) => match &atom {
-                        AlignmentAtom::Compress => "".to_string(),
-                        AlignmentAtom::Bytes { length } => {
-                            let mut s = hex::encode(&value.0);
-
-                            if let Some(missing_zeroes) =
-                                (*length as usize).checked_sub(value.0.len())
-                            {
-                                s.extend(std::iter::repeat_n('0', missing_zeroes * 2));
-                            }
-
-                            s
-                        }
-                        AlignmentAtom::Field => hex::encode(&value.0),
-                    },
-                    _ => todo!(),
-                })
-                .fold(String::new(), |mut s, v| {
-                    s.push_str(&v);
-                    s.push(';');
-                    s
-                });
-
-            joined.pop();
-
-            joined
-        })
-        .collect::<Vec<_>>();
-
-    db.update_contract_state(
-        &contract_address,
-        &mapped_entries[0],
-        &mapped_entries[1],
-        &mapped_entries[2],
-        &mapped_entries[3],
-        block_height,
-    )
-    .await?;
-
-    Ok(())
-}
-
-#[derive(Clone)]
-pub struct SessionId(pub String);
-
-impl SessionId {
-    pub async fn disconnect(
-        self,
-        indexer_http_url: &Url,
-        client: &reqwest::Client,
-    ) -> anyhow::Result<()> {
-        let connect_query = format!(
-            r#"mutation {{
-        disconnect(sessionId: "{}")
-    }}"#,
-            self.0
-        );
-
-        client
-            .post(indexer_http_url.to_string())
-            .json(&json!({
-                "query": connect_query,
-            }))
-            .send()
-            .await?;
-
-        Ok(())
-    }
-}
-
-async fn connect_wallet_to_indexer(
-    indexer_http_url: &Url,
-    secret_keys: &SecretKeys,
-    client: &reqwest::Client,
-    network_id: NetworkId,
-) -> Result<SessionId, anyhow::Error> {
-    let mut buffer = vec![];
-    // IMPORTANT: this would allow the indexer to know which transactions are ours.
-    <_ as Serializable>::serialize(&secret_keys.encryption_secret_key, &mut buffer)
-        .context("Serialization failed on encryption secret key")?;
-
-    let hrp = match network_id {
-        NetworkId::Undeployed => "mn_shield-esk_undeployed",
-        NetworkId::TestNet => "mn_shield-esk_test",
-        NetworkId::MainNet => "mn_shield-esk",
-        NetworkId::DevNet => "mn_shield-esk_dev",
-        _ => anyhow::bail!("unknown network id"),
-    };
-
-    let bech32_viewing_key = bech32::encode::<bech32::Bech32>(
-        bech32::Hrp::parse(hrp).context("Couldn't parse bech32 HRP")?,
-        &buffer,
-    )
-    .context("bech32 encoding of viewing key")?;
-
-    let connect_query = format!(
-        r#"mutation {{
-        connect(viewingKey: "{}")
-    }}"#,
-        bech32_viewing_key
-    );
-
-    use serde::Deserialize;
-    #[derive(Deserialize)]
-    struct Data {
-        data: Connect,
-    }
-
-    #[derive(Deserialize)]
-    struct Connect {
-        connect: String,
-    }
-    let res: Data = client
-        .post(indexer_http_url.to_string())
-        .json(&json!({
-            "query": connect_query,
-        }))
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    Ok(SessionId(res.data.connect))
 }

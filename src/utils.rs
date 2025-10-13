@@ -1,3 +1,5 @@
+use base_crypto::time::Timestamp;
+
 pub struct OnDrop<F: FnOnce()> {
     f: Option<F>,
 }
@@ -20,4 +22,13 @@ where
     pub fn cancel(&mut self) {
         self.f = None;
     }
+}
+
+pub fn get_current_time() -> Timestamp {
+    Timestamp::from_secs(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("System time is before Unix epoch")
+            .as_secs(),
+    )
 }
